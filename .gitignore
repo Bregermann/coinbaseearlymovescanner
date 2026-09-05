@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Coinbase Early Move Scanner local SQLite runtime files
+scanner.db
+scanner.db-*
+*.sqlite
+*.sqlite3
+
+# Local environment secrets
+.env.*
+!.env.example
+
+# Local runtime process logs
+runtime/
