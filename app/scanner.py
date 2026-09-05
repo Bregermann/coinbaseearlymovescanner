@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from collections import Counter
 from datetime import timedelta
 from typing import Any
 
@@ -20,6 +22,12 @@ from app.coinbase.products import canonicalize_spot_products
 from app.coinbase.rest import CoinbaseRestClient
 from app.coinbase.websocket import CoinbaseWebSocketClient
 from app.config import Settings, get_settings
+from app.diagnostics import (
+    build_candidate_diagnostic,
+    diagnostics_status,
+    qualification_blockers,
+    quote_age_seconds_at,
+)
 from app.database.connection import init_db, session_scope
 from app.database.repositories import (
     AlertRepository,
@@ -53,22 +61,40 @@ class ScannerService:
         self.discord = DiscordWebhookClient(self.settings)
         self.deduplicator = AlertDeduplicator(self.settings)
         self.performance = PerformanceTracker(self.settings)
+        self.started_at = utc_now()
+        self.last_quote_at = None
+        self.last_quote_product_id = None
+        self.last_candle_at = None
+        self.last_candle_product_id = None
+        self.last_book_at = None
+        self.last_book_product_id = None
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
     async def start(self) -> None:
+        self.started_at = utc_now()
         await init_db(self.settings)
         await self.refresh_products()
         await self.refresh_metadata()
         await self._start_websocket()
         self.catalysts.set_known_assets(self.asset_to_product_id.keys())
         await self.catalysts.start()
+        async with session_scope(self.settings) as session:
+            await StatusRepository(session).set_status(
+                "runtime",
+                {
+                    "started_at": self.started_at.isoformat(),
+                    "pid": os.getpid(),
+                    "products": len(self.products),
+                },
+            )
         self._tasks = [
             asyncio.create_task(self._persistence_loop(), name="persistence-loop"),
             asyncio.create_task(self._scan_loop(), name="scan-loop"),
             asyncio.create_task(self._product_refresh_loop(), name="product-refresh-loop"),
             asyncio.create_task(self._metadata_loop(), name="metadata-loop"),
             asyncio.create_task(self._history_bootstrap_loop(), name="history-bootstrap-loop"),
+            asyncio.create_task(self._heartbeat_loop(), name="heartbeat-loop"),
             asyncio.create_task(self.performance.run_forever(), name="performance-tracker"),
         ]
         logger.info("scanner_started", extra={"_products": len(self.products)})
@@ -123,106 +149,162 @@ class ScannerService:
 
     async def scan_once(self, persist_and_alert: bool = True) -> list[Candidate]:
         now = utc_now()
-        since = now - timedelta(days=max(self.settings.bootstrap_history_days, 31))
-        candidates: list[Candidate] = []
-        volume_by_asset = {}
-        cap_by_asset: dict[str, MarketCapMetrics] = {}
-        pending: list[tuple[ProductInfo, LiveQuote, list[CandlePoint], Any, dict[str, Any] | None]] = []
-
         async with session_scope(self.settings) as session:
-            market_repo = MarketRepository(session)
-            metadata_repo = MetadataRepository(session)
-            catalyst_repo = CatalystRepository(session)
-            metadata = await metadata_repo.all_metadata()
-            fresh_catalysts = await catalyst_repo.fresh_catalysts(now - timedelta(minutes=self.settings.catalyst_fresh_window_minutes))
-            catalyst_by_asset = _catalyst_map(fresh_catalysts)
-
-            for product in self.products.values():
-                quote = self.latest_quotes.get(product.product_id) or await market_repo.latest_quote(product.product_id)
-                if quote is None or quote.price <= 0:
-                    continue
-                if quote.quote_age_seconds is not None and quote.quote_age_seconds > self.settings.alert_max_quote_age_seconds * 3:
-                    continue
-                candles = await market_repo.recent_candles(product.product_id, since)
-                if len(candles) < 12:
-                    continue
-                volume = calculate_volume_metrics(candles, now)
-                cap = market_cap_metrics_from_metadata(metadata.get(product.base_currency), quote)
-                volume_by_asset[product.base_currency] = volume
-                cap_by_asset[product.base_currency] = cap
-                pending.append((product, quote, candles, volume, catalyst_by_asset.get(product.base_currency)))
-
-            rotation_scores = microcap_rotation_score(cap_by_asset, volume_by_asset, threshold=self.settings.microcap_threshold_usd)
-            alert_repo = AlertRepository(session)
-            for product, quote, candles, volume, catalyst in pending:
-                structure = analyze_structure(candles, quote.price, now)
-                book = self.latest_book_summaries.get(product.product_id)
-                if book is None:
-                    row = await market_repo.latest_order_book_summary(product.product_id)
-                    book = row.raw_summary if row and row.raw_summary else None
-                liquidity = metrics_from_summary(book)
-                cap = cap_by_asset[product.base_currency]
-                dormant = dormancy_score(candles, now)
-                rotation = rotation_scores.get(product.base_currency, 0.0)
-                score = score_candidate(
-                    volume,
-                    structure,
-                    liquidity,
-                    cap,
-                    quote.quote_age_seconds,
-                    catalyst=catalyst,
-                    rotation_score=rotation,
-                    microcap_threshold=self.settings.microcap_threshold_usd,
-                )
-                if dormant >= 70.0 and cap.circulating_market_cap and cap.circulating_market_cap <= self.settings.microcap_threshold_usd:
-                    score.components["DormancyScore"] = max(score.components.get("DormancyScore", 0.0), dormant)
-                status = choose_status(structure.status, score.catalyst_score, structure.extension_24h_pct)
-                targets = generate_targets(quote.price, structure)
-                tags = build_tags(product, cap, volume, structure, score, self.settings.microcap_threshold_usd, catalyst)
-                candidate = Candidate(
-                    product_id=product.product_id,
-                    symbol=product.base_currency,
-                    status=status,
-                    quote=quote,
-                    volume=volume,
-                    structure=structure,
-                    liquidity=liquidity,
-                    market_cap=cap,
-                    targets=targets,
-                    score=score,
-                    catalyst=catalyst,
-                    tags=tags,
-                )
-                if qualifies(candidate, self.settings):
-                    candidates.append(candidate)
-                    if persist_and_alert:
-                        await alert_repo.insert_candidate_snapshot(candidate_to_record(candidate))
-
+            diagnostics, skipped = await self.evaluate_candidates(session, now, include_stale=False)
+            candidates = [item.candidate for item in diagnostics if item.qualifies]
             candidates.sort(key=lambda item: item.score.early_move_score, reverse=True)
             candidates = candidates[: self.settings.candidate_limit]
             if persist_and_alert:
+                alert_repo = AlertRepository(session)
                 for candidate in candidates:
-                    await self._maybe_alert(session, candidate)
-                await StatusRepository(session).set_status(
-                    "scan",
-                    {
-                        "last_scan_at": now.isoformat(),
-                        "qualifying": len(candidates),
-                        "top": [
-                            {"symbol": c.symbol, "score": c.score.early_move_score, "status": c.status.value}
-                            for c in candidates
-                        ],
-                    },
-                )
+                    await alert_repo.insert_candidate_snapshot(candidate_to_record(candidate))
+                sent = 0
+                for candidate in candidates:
+                    if await self._maybe_alert(session, candidate, quote_age_seconds=diagnostic_quote_age(diagnostics, candidate.product_id)):
+                        sent += 1
+                scan_status = {
+                    "last_scan_at": now.isoformat(),
+                    "qualifying": len(candidates),
+                    "alerts_sent_this_scan": sent,
+                    "top": [
+                        {"symbol": c.symbol, "score": c.score.early_move_score, "status": c.status.value}
+                        for c in candidates
+                    ],
+                }
+                diag_status = diagnostics_status(diagnostics, skipped, products_checked=len(self.products))
+                diag_status["last_scan_at"] = now.isoformat()
+                diag_status["alerts_sent_this_scan"] = sent
+                await StatusRepository(session).set_status("scan", scan_status)
+                await StatusRepository(session).set_status("diagnostics", diag_status)
         return candidates
 
-    async def _maybe_alert(self, session: Any, candidate: Candidate) -> None:
+    async def evaluate_candidates(
+        self,
+        session: Any,
+        now: Any | None = None,
+        *,
+        include_stale: bool = False,
+    ) -> tuple[list[Any], dict[str, int]]:
+        now = now or utc_now()
+        since = now - timedelta(days=max(self.settings.analysis_history_days, 31))
+        diagnostics: list[Any] = []
+        skipped: Counter[str] = Counter()
+        volume_by_asset = {}
+        cap_by_asset: dict[str, MarketCapMetrics] = {}
+        pending: list[tuple[ProductInfo, LiveQuote, float | None, list[CandlePoint], Any, dict[str, Any] | None]] = []
+
+        market_repo = MarketRepository(session)
+        metadata_repo = MetadataRepository(session)
+        catalyst_repo = CatalystRepository(session)
+        alert_repo = AlertRepository(session)
+        metadata = await metadata_repo.all_metadata()
+        fresh_catalysts = await catalyst_repo.fresh_catalysts(now - timedelta(minutes=self.settings.catalyst_fresh_window_minutes))
+        catalyst_by_asset = _catalyst_map(fresh_catalysts)
+        active_alerts = await alert_repo.active_alerts_by_product()
+
+        for product in self.products.values():
+            quote = self.latest_quotes.get(product.product_id) or await market_repo.latest_quote(product.product_id)
+            if quote is None or quote.price <= 0:
+                skipped["missing data"] += 1
+                continue
+            quote_age = quote_age_seconds_at(quote, now)
+            if not include_stale and (
+                quote_age is None
+                or quote_age > self.settings.alert_max_quote_age_seconds * 3
+            ):
+                skipped["stale data"] += 1
+                continue
+            candles = await market_repo.recent_candles(product.product_id, since)
+            if len(candles) < 12:
+                skipped["insufficient history"] += 1
+                continue
+            volume = calculate_volume_metrics(candles, now)
+            cap = market_cap_metrics_from_metadata(metadata.get(product.base_currency), quote)
+            volume_by_asset[product.base_currency] = volume
+            cap_by_asset[product.base_currency] = cap
+            pending.append((product, quote, quote_age, candles, volume, catalyst_by_asset.get(product.base_currency)))
+
+        rotation_scores = microcap_rotation_score(cap_by_asset, volume_by_asset, threshold=self.settings.microcap_threshold_usd)
+        for product, quote, quote_age, candles, volume, catalyst in pending:
+            structure = analyze_structure(candles, quote.price, now)
+            structure.highs.update(
+                await market_repo.highs_since_windows(
+                    product.product_id,
+                    {
+                        "90d": now - timedelta(days=90),
+                        "180d": now - timedelta(days=180),
+                        "1y": now - timedelta(days=365),
+                    },
+                )
+            )
+            book = self.latest_book_summaries.get(product.product_id)
+            if book is None:
+                row = await market_repo.latest_order_book_summary(product.product_id)
+                book = row.raw_summary if row and row.raw_summary else None
+            liquidity = metrics_from_summary(book)
+            cap = cap_by_asset[product.base_currency]
+            dormant = dormancy_score(candles, now)
+            rotation = rotation_scores.get(product.base_currency, 0.0)
+            score = score_candidate(
+                volume,
+                structure,
+                liquidity,
+                cap,
+                quote_age,
+                catalyst=catalyst,
+                rotation_score=rotation,
+                microcap_threshold=self.settings.microcap_threshold_usd,
+            )
+            if dormant >= 70.0 and cap.circulating_market_cap and cap.circulating_market_cap <= self.settings.microcap_threshold_usd:
+                score.components["DormancyScore"] = max(score.components.get("DormancyScore", 0.0), dormant)
+            status = choose_status(structure.status, score.catalyst_score, structure.extension_24h_pct)
+            targets = generate_targets(quote.price, structure)
+            tags = build_tags(product, cap, volume, structure, score, self.settings.microcap_threshold_usd, catalyst)
+            candidate = Candidate(
+                product_id=product.product_id,
+                symbol=product.base_currency,
+                status=status,
+                quote=quote,
+                volume=volume,
+                structure=structure,
+                liquidity=liquidity,
+                market_cap=cap,
+                targets=targets,
+                score=score,
+                catalyst=catalyst,
+                tags=tags,
+            )
+            active = active_alerts.get(product.product_id)
+            decision = None
+            if not qualification_blockers(candidate, self.settings, quote_age):
+                decision = self.deduplicator.decide(candidate, active, quote_age_seconds=quote_age)
+            diagnostics.append(
+                build_candidate_diagnostic(
+                    candidate,
+                    self.settings,
+                    candle_count=len(candles),
+                    active_alert=active,
+                    alert_decision=decision,
+                    quote_age_seconds=quote_age,
+                )
+            )
+
+        diagnostics.sort(key=lambda item: item.candidate.score.early_move_score, reverse=True)
+        return diagnostics, dict(skipped)
+
+    async def _maybe_alert(self, session: Any, candidate: Candidate, quote_age_seconds: float | None = None) -> bool:
         alert_repo = AlertRepository(session)
         active = await alert_repo.active_alert_for_product(candidate.product_id)
-        decision = self.deduplicator.decide(candidate, active)
+        decision = self.deduplicator.decide(candidate, active, quote_age_seconds=quote_age_seconds)
         if not decision.should_send:
-            return
-        message_id = await self.discord.send_candidate(candidate, alert_type=decision.alert_type)
+            return False
+        message_id = await self.discord.send_candidate(candidate, alert_type=decision.alert_type, quote_age_seconds=quote_age_seconds)
+        if message_id is None:
+            logger.error(
+                "alert_delivery_failed_no_dedupe",
+                extra={"_product_id": candidate.product_id, "_type": decision.alert_type},
+            )
+            return False
         catalyst_id = candidate.catalyst.get("id") if candidate.catalyst else None
         if active is not None:
             await alert_repo.close_alert(active, decision.reason)
@@ -235,6 +317,7 @@ class ScannerService:
         if decision.alert_type != "invalidation":
             await alert_repo.create_observation_schedule(alert)
         logger.info("alert_sent", extra={"_product_id": candidate.product_id, "_type": decision.alert_type, "_score": candidate.score.early_move_score})
+        return True
 
     async def _start_websocket(self) -> None:
         product_ids = list(self.products)
@@ -254,13 +337,19 @@ class ScannerService:
 
     async def _on_quote(self, quote: LiveQuote) -> None:
         self.latest_quotes[quote.product_id] = quote
+        self.last_quote_at = utc_now()
+        self.last_quote_product_id = quote.product_id
         await _put_latest(self.quote_queue, quote)
 
     async def _on_candle(self, candle: CandlePoint) -> None:
+        self.last_candle_at = utc_now()
+        self.last_candle_product_id = candle.product_id
         await _put_latest(self.candle_queue, candle)
 
     async def _on_book_summary(self, product_id: str, summary: dict[str, Any]) -> None:
         self.latest_book_summaries[product_id] = summary
+        self.last_book_at = utc_now()
+        self.last_book_product_id = product_id
         await _put_latest(self.book_queue, (product_id, summary))
 
     async def _on_status(self, key: str, value: dict[str, Any]) -> None:
@@ -281,13 +370,39 @@ class ScannerService:
                         for product_id, summary in books:
                             await repo.insert_order_book_summary(product_id, summary)
                     async with session_scope(self.settings) as session:
+                        now = utc_now()
+                        ws_client = self.ws_client
                         await StatusRepository(session).set_status(
                             "websocket",
                             {
                                 "latest_quotes": len(self.latest_quotes),
                                 "latest_books": len(self.latest_book_summaries),
+                                "assets_subscribed": len(self.products),
+                                "assets_receiving_live_data": count_recent_quotes(self.latest_quotes, 60.0),
+                                "assets_fresh_for_alerts": count_recent_quotes(
+                                    self.latest_quotes,
+                                    self.settings.alert_max_quote_age_seconds,
+                                ),
+                                "connected_chunks": ws_client.connected_chunks if ws_client else 0,
+                                "last_coinbase_message_at": isoformat(ws_client.last_message_at if ws_client else None),
+                                "last_ticker": {
+                                    "product_id": self.last_quote_product_id,
+                                    "received_at": isoformat(self.last_quote_at),
+                                },
+                                "last_trade": {
+                                    "product_id": ws_client.last_trade_product_id if ws_client else None,
+                                    "received_at": isoformat(ws_client.last_trade_at if ws_client else None),
+                                },
+                                "last_candle": {
+                                    "product_id": self.last_candle_product_id,
+                                    "received_at": isoformat(self.last_candle_at),
+                                },
+                                "last_order_book": {
+                                    "product_id": self.last_book_product_id,
+                                    "received_at": isoformat(self.last_book_at),
+                                },
                                 "ws_status": self.ws_status,
-                                "last_persist_at": utc_now().isoformat(),
+                                "last_persist_at": now.isoformat(),
                             },
                         )
             except Exception as exc:  # noqa: BLE001
@@ -322,6 +437,59 @@ class ScannerService:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("metadata_refresh_failed", extra={"_error": str(exc)})
 
+    async def _heartbeat_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._emit_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("heartbeat_loop_failed", extra={"_error_type": type(exc).__name__})
+            await asyncio.sleep(self.settings.discord_heartbeat_seconds)
+
+    async def _emit_heartbeat(self) -> None:
+        async with session_scope(self.settings) as session:
+            statuses = await StatusRepository(session).all_status()
+            alert_repo = AlertRepository(session)
+            now = utc_now()
+            alerts_1h = len(await alert_repo.alerts_since(now - timedelta(hours=1)))
+        diagnostics = statuses.get("diagnostics", {}).get("value", {})
+        websocket = statuses.get("websocket", {}).get("value", {})
+        score_counts = diagnostics.get("score_counts", {}) if isinstance(diagnostics, dict) else {}
+        top = diagnostics.get("top_candidates", []) if isinstance(diagnostics, dict) else []
+        near_miss = top[0] if top else None
+        payload = {
+            "username": "Coinbase Early Move Scanner",
+            "embeds": [
+                {
+                    "title": "SCANNER ALIVE",
+                    "description": "Diagnostic heartbeat. This is not a production alert.",
+                    "color": 0x3498DB,
+                    "fields": [
+                        {"name": "Coinbase", "value": "CONNECTED" if websocket.get("connected_chunks", 0) else "UNKNOWN", "inline": True},
+                        {"name": "Quote age", "value": heartbeat_quote_age(self.latest_quotes), "inline": True},
+                        {"name": "Assets monitored", "value": str(len(self.products)), "inline": True},
+                        {"name": "Candidates evaluated", "value": str(diagnostics.get("candidates_evaluated", 0)), "inline": True},
+                        {"name": "Current >=70", "value": str(score_counts.get("gte_70", 0)), "inline": True},
+                        {"name": "Production alerts 1h", "value": str(alerts_1h), "inline": True},
+                        {"name": "Top near-miss", "value": format_near_miss(near_miss), "inline": False},
+                    ],
+                }
+            ],
+        }
+        webhook = self.settings.debug_webhook
+        if not webhook and self.settings.discord_heartbeat_allow_primary:
+            webhook = self.settings.alert_webhook
+        if webhook:
+            await self.discord.send_payload(payload, webhook_url=webhook)
+        else:
+            logger.info(
+                "scanner_alive",
+                extra={
+                    "_assets": len(self.products),
+                    "_fresh_assets": count_recent_quotes(self.latest_quotes, self.settings.alert_max_quote_age_seconds),
+                    "_score_gte_70": score_counts.get("gte_70", 0),
+                    "_alerts_1h": alerts_1h,
+                },
+            )
     async def _history_bootstrap_loop(self) -> None:
         while not self._stop.is_set():
             results: dict[str, int] = {}
@@ -373,12 +541,7 @@ def summarize_ws_status(value: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {"value": str(value)}
 
 def qualifies(candidate: Candidate, settings: Settings) -> bool:
-    if candidate.quote.quote_age_seconds is None or candidate.quote.quote_age_seconds > settings.alert_max_quote_age_seconds:
-        return False
-    catalyst_override = candidate.score.catalyst_score >= settings.min_catalyst_override_score
-    if candidate.status == SetupStatus.ALREADY_EXTENDED and not catalyst_override:
-        return False
-    return candidate.score.early_move_score >= settings.min_early_move_score or catalyst_override
+    return not qualification_blockers(candidate, settings)
 
 
 def choose_status(base_status: SetupStatus, catalyst_score: float, extension_24h_pct: float | None) -> SetupStatus:
@@ -447,3 +610,37 @@ def drain_queue(queue: asyncio.Queue[Any], limit: int) -> list[Any]:
         except asyncio.QueueEmpty:
             break
     return items
+
+
+def isoformat(value: Any | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def count_recent_quotes(quotes: dict[str, LiveQuote], max_age_seconds: float) -> int:
+    return sum(
+        1
+        for quote in quotes.values()
+        if quote.quote_age_seconds is not None and quote.quote_age_seconds <= max_age_seconds
+    )
+
+
+def heartbeat_quote_age(quotes: dict[str, LiveQuote]) -> str:
+    ages = [quote.quote_age_seconds for quote in quotes.values() if quote.quote_age_seconds is not None]
+    if not ages:
+        return "n/a"
+    return f"{min(ages):.1f} sec"
+
+
+def format_near_miss(row: Any | None) -> str:
+    if not isinstance(row, dict):
+        return "None"
+    reasons = row.get("suppression_reasons") or row.get("warnings") or ["n/a"]
+    score = row.get("early_move_score")
+    score_text = f"{score:.0f}" if isinstance(score, (int, float)) else "n/a"
+    return f"{row.get('symbol', 'n/a')} - score {score_text}; failed because: {reasons[0]}"
+
+def diagnostic_quote_age(diagnostics: list[Any], product_id: str) -> float | None:
+    for item in diagnostics:
+        if item.candidate.product_id == product_id:
+            return item.quote_age_seconds
+    return None

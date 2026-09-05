@@ -48,6 +48,8 @@ class CoinbaseWebSocketClient:
         self._last_book_emit: dict[str, datetime] = {}
         self.connected_chunks = 0
         self.last_message_at: datetime | None = None
+        self.last_trade_at: datetime | None = None
+        self.last_trade_product_id: str | None = None
 
     async def start(self) -> None:
         self._stop.clear()
@@ -160,6 +162,8 @@ class CoinbaseWebSocketClient:
                 trade = parse_trade(row)
                 if trade is None:
                     continue
+                self.last_trade_at = trade.trade_time
+                self.last_trade_product_id = trade.product_id
                 closed = self.trade_candles.ingest(trade)
                 if closed is not None:
                     await self.on_candle(closed)

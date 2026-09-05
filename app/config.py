@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     coinbase_ws_max_message_size_bytes: int = 67_108_864
     enable_level2: bool = True
     enable_candles_channel: bool = True
-    bootstrap_history_days: int = 31
+    bootstrap_history_days: int = 365
+    analysis_history_days: int = 31
     bootstrap_concurrency: int = 1
     max_products_for_bootstrap_per_cycle: int = 9999
 
@@ -56,6 +57,8 @@ class Settings(BaseSettings):
     discord_debug_webhook_url: HttpUrl | None = None
     discord_timeout_seconds: float = 10.0
     discord_test_username: str = "Coinbase Early Move Scanner"
+    discord_heartbeat_seconds: int = 3600
+    discord_heartbeat_allow_primary: bool = False
 
     api_host: str = "0.0.0.0"
     api_port: int = 8000

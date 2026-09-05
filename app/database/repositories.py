@@ -268,6 +268,20 @@ class MarketRepository:
         )
         return result.scalar_one_or_none()
 
+    async def highs_since_windows(self, product_id: str, windows: dict[str, datetime]) -> dict[str, float]:
+        highs: dict[str, float] = {}
+        for label, since in windows.items():
+            result = await self.session.execute(
+                select(func.max(CandleModel.high)).where(
+                    CandleModel.product_id == product_id,
+                    CandleModel.start >= since,
+                )
+            )
+            value = result.scalar_one_or_none()
+            if value is not None:
+                highs[label] = float(value)
+        return highs
+
 
 class MetadataRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -350,6 +364,17 @@ class AlertRepository:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    async def active_alerts_by_product(self) -> dict[str, AlertModel]:
+        result = await self.session.execute(
+            select(AlertModel)
+            .where(AlertModel.is_active.is_(True))
+            .order_by(desc(AlertModel.detection_time))
+        )
+        active: dict[str, AlertModel] = {}
+        for alert in result.scalars():
+            active.setdefault(alert.product_id, alert)
+        return active
 
     async def create_alert(self, data: dict[str, Any]) -> AlertModel:
         model = AlertModel(**data)

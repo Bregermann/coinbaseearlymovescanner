@@ -34,8 +34,8 @@ class DiscordWebhookClient:
             self._client = httpx.AsyncClient(timeout=self.settings.discord_timeout_seconds)
         return self._client
 
-    async def send_candidate(self, candidate: Candidate, alert_type: str = "new_setup") -> str | None:
-        payload = candidate_to_payload(candidate, alert_type=alert_type)
+    async def send_candidate(self, candidate: Candidate, alert_type: str = "new_setup", quote_age_seconds: float | None = None) -> str | None:
+        payload = candidate_to_payload(candidate, alert_type=alert_type, quote_age_seconds=quote_age_seconds)
         return await self.send_payload(payload, webhook_url=self.settings.alert_webhook)
 
     async def send_catalyst_payload(self, payload: dict[str, Any]) -> str | None:

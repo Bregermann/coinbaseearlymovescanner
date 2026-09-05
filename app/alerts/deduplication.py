@@ -19,8 +19,8 @@ class AlertDeduplicator:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
-    def decide(self, candidate: Candidate, active_alert: Any | None) -> AlertDecision:
-        age = candidate.quote.quote_age_seconds
+    def decide(self, candidate: Candidate, active_alert: Any | None, quote_age_seconds: float | None = None) -> AlertDecision:
+        age = quote_age_seconds if quote_age_seconds is not None else candidate.quote.quote_age_seconds
         if age is None or age > self.settings.alert_max_quote_age_seconds:
             return AlertDecision(False, "stale", "quote data is stale")
 

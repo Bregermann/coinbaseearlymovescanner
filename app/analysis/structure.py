@@ -13,6 +13,10 @@ HIGH_WINDOWS = {
     "24h": timedelta(hours=24),
     "3d": timedelta(days=3),
     "7d": timedelta(days=7),
+    "30d": timedelta(days=30),
+    "90d": timedelta(days=90),
+    "180d": timedelta(days=180),
+    "1y": timedelta(days=365),
 }
 
 

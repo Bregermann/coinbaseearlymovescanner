@@ -12,9 +12,19 @@ if (-not $hostExe) {
     $hostExe = (Get-Command powershell).Source
 }
 
-$argument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ProjectRoot "{1}"' -f $startScript, $ProjectRoot
+$argument = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -ProjectRoot "{1}"' -f $startScript, $ProjectRoot
 $action = New-ScheduledTaskAction -Execute $hostExe -Argument $argument -WorkingDirectory $ProjectRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Keeps the Coinbase Early Move Scanner watchdog running after logon.' -Force | Out-Null
-Write-Output "scheduled task installed: $TaskName"
+
+try {
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description 'Keeps the Coinbase Early Move Scanner watchdog running after logon.' -Force | Out-Null
+    Write-Output "scheduled task installed: $TaskName"
+}
+catch {
+    $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $runName = 'CoinbaseEarlyMoveScannerWatchdog'
+    $runValue = '{0} {1}' -f $hostExe, $argument
+    Set-ItemProperty -Path $runPath -Name $runName -Value $runValue
+    Write-Output "scheduled task unavailable; installed current-user Run key: $runName"
+}

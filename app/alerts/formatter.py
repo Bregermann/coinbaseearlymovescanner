@@ -20,12 +20,12 @@ STATUS_COLORS = {
 }
 
 
-def candidate_to_payload(candidate: Candidate, alert_type: str = "new_setup") -> dict[str, Any]:
-    embed = candidate_to_embed(candidate, alert_type=alert_type)
+def candidate_to_payload(candidate: Candidate, alert_type: str = "new_setup", quote_age_seconds: float | None = None) -> dict[str, Any]:
+    embed = candidate_to_embed(candidate, alert_type=alert_type, quote_age_seconds=quote_age_seconds)
     return {"username": "Coinbase Early Move Scanner", "embeds": [embed]}
 
 
-def candidate_to_embed(candidate: Candidate, alert_type: str = "new_setup") -> dict[str, Any]:
+def candidate_to_embed(candidate: Candidate, alert_type: str = "new_setup", quote_age_seconds: float | None = None) -> dict[str, Any]:
     symbol = candidate.symbol
     title_prefix = "⚡" if alert_type in {"breakout_followup", "status_transition"} else "🚨"
     if alert_type == "invalidation":
@@ -46,7 +46,7 @@ def candidate_to_embed(candidate: Candidate, alert_type: str = "new_setup") -> d
         "description": subtitle,
         "color": STATUS_COLORS.get(candidate.status, 0x3498DB),
         "fields": fields,
-        "footer": {"text": footer(candidate)},
+        "footer": {"text": footer(candidate, quote_age_seconds=quote_age_seconds)},
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if candidate.catalyst and candidate.status == SetupStatus.FAST_MOVE:
@@ -144,8 +144,8 @@ def risks(candidate: Candidate) -> str:
     return "\n".join(candidate.score.risks or ["No specific risk flags generated."])
 
 
-def footer(candidate: Candidate) -> str:
-    age = candidate.quote.quote_age_seconds
+def footer(candidate: Candidate, quote_age_seconds: float | None = None) -> str:
+    age = quote_age_seconds if quote_age_seconds is not None else candidate.quote.quote_age_seconds
     age_text = "unknown" if age is None else f"{age:.1f} sec"
     now = datetime.now(ET)
     hour = ((now.hour - 1) % 12) + 1
