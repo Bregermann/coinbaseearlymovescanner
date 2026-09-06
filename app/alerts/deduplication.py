@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from app.analysis.scoring import primary_score
 from app.config import Settings, get_settings
 from app.types import Candidate, SetupStatus
 
@@ -28,10 +29,11 @@ class AlertDeduplicator:
             return AlertDecision(True, "invalidation", "setup invalidated", close_existing=True)
 
         catalyst_strength = candidate.score.catalyst_score
-        qualifies = candidate.score.early_move_score >= self.settings.min_early_move_score
+        score = primary_score(candidate)
+        qualifies = score >= self.settings.min_risk_adjusted_opportunity_score
         catalyst_override = catalyst_strength >= self.settings.min_catalyst_override_score
         if not qualifies and not catalyst_override:
-            return AlertDecision(False, "below_threshold", "score below alert threshold")
+            return AlertDecision(False, "below_threshold", "risk-adjusted score below alert threshold")
 
         if active_alert is None:
             alert_type = "fast_move" if candidate.status == SetupStatus.FAST_MOVE else "new_setup"
@@ -45,14 +47,21 @@ class AlertDeduplicator:
         if active_alert.trigger_price and candidate.quote.price >= active_alert.trigger_price and old_status == SetupStatus.EARLY.value:
             return AlertDecision(True, "breakout_followup", "breakout trigger hit")
 
-        old_score = float(active_alert.score or 0.0)
-        if candidate.score.early_move_score - old_score >= 8.0:
-            return AlertDecision(True, "major_score_change", "material score improvement")
+        old_score = active_alert_score(active_alert)
+        if score - old_score >= 8.0:
+            return AlertDecision(True, "major_score_change", "material risk-adjusted score improvement")
 
         if catalyst_override and active_alert.catalyst_id is None:
             return AlertDecision(True, "new_major_catalyst", "new catalyst override")
 
         return AlertDecision(False, "duplicate", "no material setup change")
+
+
+def active_alert_score(active_alert: Any) -> float:
+    components = getattr(active_alert, "component_scores", None) or {}
+    if isinstance(components, dict) and components.get("RiskAdjustedOpportunityScore") is not None:
+        return float(components["RiskAdjustedOpportunityScore"])
+    return float(getattr(active_alert, "score", 0.0) or 0.0)
 
 
 def status_rank(status: str) -> int:

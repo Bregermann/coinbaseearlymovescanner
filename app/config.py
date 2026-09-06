@@ -39,10 +39,18 @@ class Settings(BaseSettings):
     scan_interval_seconds: float = 10.0
     candidate_limit: int = 5
     min_early_move_score: float = 78.0
+    min_risk_adjusted_opportunity_score: float = 78.0
+    min_microcap_risk_adjusted_opportunity_score: float = 88.0
+    min_microcap_early_move_score: float = 82.0
+    min_microcap_liquidity_safety_score: float = 55.0
+    min_microcap_volume_acceleration_score: float = 45.0
     min_catalyst_override_score: float = 85.0
     suppress_extended_24h_pct: float = 20.0
 
-    microcap_threshold_usd: float = 15_000_000.0
+    market_cap_large_threshold_usd: float = 1_000_000_000.0
+    market_cap_mid_threshold_usd: float = 250_000_000.0
+    market_cap_small_threshold_usd: float = 50_000_000.0
+    microcap_threshold_usd: float = 50_000_000.0
     microcap_refresh_seconds: int = 600
     coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     coingecko_timeout_seconds: float = 15.0

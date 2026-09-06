@@ -13,7 +13,7 @@ from app.alerts.formatter import candidate_to_alert_record, candidate_to_record
 from app.analysis.liquidity import metrics_from_summary
 from app.analysis.microcaps import dormancy_score, market_cap_metrics_from_metadata, microcap_tags
 from app.analysis.rotation import microcap_rotation_score
-from app.analysis.scoring import score_candidate
+from app.analysis.scoring import apply_risk_adjusted_opportunity, market_cap_class, primary_score, score_candidate
 from app.analysis.structure import analyze_structure
 from app.analysis.targets import generate_targets
 from app.analysis.volume import calculate_volume_metrics
@@ -152,7 +152,7 @@ class ScannerService:
         async with session_scope(self.settings) as session:
             diagnostics, skipped = await self.evaluate_candidates(session, now, include_stale=False)
             candidates = [item.candidate for item in diagnostics if item.qualifies]
-            candidates.sort(key=lambda item: item.score.early_move_score, reverse=True)
+            candidates.sort(key=primary_score, reverse=True)
             candidates = candidates[: self.settings.candidate_limit]
             if persist_and_alert:
                 alert_repo = AlertRepository(session)
@@ -167,11 +167,11 @@ class ScannerService:
                     "qualifying": len(candidates),
                     "alerts_sent_this_scan": sent,
                     "top": [
-                        {"symbol": c.symbol, "score": c.score.early_move_score, "status": c.status.value}
+                        {"symbol": c.symbol, "score": primary_score(c), "early_move_score": c.score.early_move_score, "status": c.status.value}
                         for c in candidates
                     ],
                 }
-                diag_status = diagnostics_status(diagnostics, skipped, products_checked=len(self.products))
+                diag_status = diagnostics_status(diagnostics, skipped, products_checked=len(self.products), settings=self.settings)
                 diag_status["last_scan_at"] = now.isoformat()
                 diag_status["alerts_sent_this_scan"] = sent
                 await StatusRepository(session).set_status("scan", scan_status)
@@ -254,12 +254,16 @@ class ScannerService:
                 catalyst=catalyst,
                 rotation_score=rotation,
                 microcap_threshold=self.settings.microcap_threshold_usd,
+                small_cap_threshold=self.settings.market_cap_small_threshold_usd,
+                mid_cap_threshold=self.settings.market_cap_mid_threshold_usd,
+                large_cap_threshold=self.settings.market_cap_large_threshold_usd,
             )
             if dormant >= 70.0 and cap.circulating_market_cap and cap.circulating_market_cap <= self.settings.microcap_threshold_usd:
                 score.components["DormancyScore"] = max(score.components.get("DormancyScore", 0.0), dormant)
-            status = choose_status(structure.status, score.catalyst_score, structure.extension_24h_pct)
             targets = generate_targets(quote.price, structure)
-            tags = build_tags(product, cap, volume, structure, score, self.settings.microcap_threshold_usd, catalyst)
+            score = apply_risk_adjusted_opportunity(score, volume, structure, liquidity, cap, targets, quote.price)
+            status = choose_status(structure.status, score.catalyst_score, structure.extension_24h_pct)
+            tags = build_tags(product, cap, volume, structure, score, self.settings, catalyst)
             candidate = Candidate(
                 product_id=product.product_id,
                 symbol=product.base_currency,
@@ -289,7 +293,7 @@ class ScannerService:
                 )
             )
 
-        diagnostics.sort(key=lambda item: item.candidate.score.early_move_score, reverse=True)
+        diagnostics.sort(key=lambda item: primary_score(item.candidate), reverse=True)
         return diagnostics, dict(skipped)
 
     async def _maybe_alert(self, session: Any, candidate: Candidate, quote_age_seconds: float | None = None) -> bool:
@@ -316,7 +320,7 @@ class ScannerService:
         alert = await alert_repo.create_alert(alert_data)
         if decision.alert_type != "invalidation":
             await alert_repo.create_observation_schedule(alert)
-        logger.info("alert_sent", extra={"_product_id": candidate.product_id, "_type": decision.alert_type, "_score": candidate.score.early_move_score})
+        logger.info("alert_sent", extra={"_product_id": candidate.product_id, "_type": decision.alert_type, "_score": primary_score(candidate)})
         return True
 
     async def _start_websocket(self) -> None:
@@ -556,19 +560,34 @@ def build_tags(
     volume: Any,
     structure: Any,
     score: Any,
-    microcap_threshold: float,
+    settings: Settings,
     catalyst: dict[str, Any] | None,
 ) -> list[str]:
-    tags = microcap_tags(cap, microcap_threshold)
+    tags = microcap_tags(cap, settings.microcap_threshold_usd)
+    cap_class = market_cap_class(
+        cap,
+        settings.market_cap_small_threshold_usd,
+        settings.market_cap_mid_threshold_usd,
+        settings.market_cap_large_threshold_usd,
+    )
+    class_tag = cap_class.lower().replace(" / ", "_").replace(" ", "_")
+    if cap_class != "UNKNOWN":
+        tags.append(class_tag)
     if volume.ratios.get("5m_vs_baseline", 0.0) >= 2.0 or volume.ratios.get("15m_vs_baseline", 0.0) >= 2.0:
         tags.append("volume_acceleration")
     if structure.compression_score >= 65.0:
         tags.append("compression")
     if score.components.get("OrderBookScore", 0.0) >= 60.0:
         tags.append("order_book")
+    if score.components.get("LiquiditySafetyScore", 0.0) >= 70.0:
+        tags.append("liquidity_safe")
+    if primary_score(score) >= settings.min_risk_adjusted_opportunity_score and cap_class in {"MID CAP", "LARGE / LIQUID", "SMALL CAP"}:
+        tags.append("high_conviction_liquid_move")
+    if primary_score(score) >= settings.min_microcap_risk_adjusted_opportunity_score and cap_class == "MICROCAP":
+        tags.append("exceptional_microcap")
     if catalyst:
         tags.append(str(catalyst.get("source", "catalyst")))
-    if cap.circulating_market_cap and cap.circulating_market_cap <= microcap_threshold and structure.compression_score >= 60.0:
+    if cap.circulating_market_cap and cap.circulating_market_cap <= settings.microcap_threshold_usd and structure.compression_score >= 60.0:
         tags.append("dormant_microcap")
     return list(dict.fromkeys(tags))
 
@@ -635,7 +654,7 @@ def format_near_miss(row: Any | None) -> str:
     if not isinstance(row, dict):
         return "None"
     reasons = row.get("suppression_reasons") or row.get("warnings") or ["n/a"]
-    score = row.get("early_move_score")
+    score = row.get("risk_adjusted_opportunity_score", row.get("early_move_score"))
     score_text = f"{score:.0f}" if isinstance(score, (int, float)) else "n/a"
     return f"{row.get('symbol', 'n/a')} - score {score_text}; failed because: {reasons[0]}"
 

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 
+from app.analysis.scoring import primary_score
 from app.config import get_settings
 from app.database.connection import init_db, session_scope
 from app.database.repositories import StatusRepository
@@ -55,7 +56,9 @@ async def candidates() -> list[dict[str, object]]:
             "product_id": item.product_id,
             "status": item.status.value,
             "price": item.quote.price,
-            "score": item.score.early_move_score,
+            "score": primary_score(item),
+            "risk_adjusted_opportunity_score": primary_score(item),
+            "early_move_score": item.score.early_move_score,
             "quote_age_seconds": item.quote.quote_age_seconds,
             "reasons": item.score.reasons,
         }

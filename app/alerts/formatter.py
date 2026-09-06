@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.analysis.scoring import book_depth_usd, dollar_volume_24h, market_cap_class, primary_score
 from app.formatting import compact_money, money, pct, ratio
 from app.types import Candidate, SetupStatus
 
@@ -34,6 +35,7 @@ def candidate_to_embed(candidate: Candidate, alert_type: str = "new_setup", quot
     subtitle = " + ".join(human_tag(tag) for tag in candidate.tags[:3]) or "Chart/Liquidity"
     fields = [
         {"name": "Snapshot", "value": snapshot_field(candidate), "inline": False},
+        {"name": "Liquidity Safety", "value": liquidity_safety_field(candidate), "inline": True},
         {"name": "Volume Acceleration", "value": volume_field(candidate), "inline": True},
         {"name": "Structure", "value": structure_field(candidate), "inline": True},
         {"name": "Targets", "value": targets_field(candidate), "inline": True},
@@ -57,16 +59,36 @@ def candidate_to_embed(candidate: Candidate, alert_type: str = "new_setup", quot
 def snapshot_field(candidate: Candidate) -> str:
     quote = candidate.quote
     cap = candidate.market_cap
-    vol_24h_quote = quote.volume_24h * quote.price if quote.volume_24h is not None else None
     return "\n".join(
         [
             f"Price: {money(quote.price)}",
             f"24h: {pct(quote.price_change_24h_pct)}",
             f"Market Cap: {compact_money(cap.circulating_market_cap)}",
+            f"Market Cap Class: {market_cap_class(cap)}",
             f"FDV: {compact_money(cap.fdv)}",
-            f"24h Coinbase Volume: {compact_money(vol_24h_quote)}",
+            f"24h Coinbase Volume: {compact_money(dollar_volume_24h(candidate.volume))}",
             f"Volume / Market Cap: {pct(cap.volume_to_market_cap, signed=False)}",
+            f"Risk-Adjusted Opportunity: {primary_score(candidate):.0f} / 100",
             f"Early Move Score: {candidate.score.early_move_score:.0f} / 100",
+        ]
+    )
+
+
+def liquidity_safety_field(candidate: Candidate) -> str:
+    components = candidate.score.components
+    liquidity = candidate.liquidity
+    safety = components.get("LiquiditySafetyScore")
+    traders = components.get("TraderCount")
+    trader_text = f"{traders:,.0f}" if isinstance(traders, (int, float)) else "N/A"
+    return "\n".join(
+        [
+            f"LIQUIDITY SAFETY: {format_score(safety)} / 100",
+            f"MARKET CAP CLASS: {market_cap_class(candidate.market_cap)}",
+            f"24H DOLLAR VOLUME: {compact_money(dollar_volume_24h(candidate.volume))}",
+            f"SPREAD: {pct(liquidity.spread_pct, signed=False)}",
+            f"BOOK DEPTH +/-1%: {compact_money(book_depth_usd(liquidity, '1'))}",
+            f"COINBASE TRADERS: {trader_text}",
+            f"RISK-ADJUSTED OPPORTUNITY: {primary_score(candidate):.0f} / 100",
         ]
     )
 
@@ -157,6 +179,10 @@ def human_tag(tag: str) -> str:
     return tag.replace("_", " ").title()
 
 
+def format_score(value: object) -> str:
+    return "N/A" if value is None else f"{float(value):.0f}"
+
+
 def candidate_to_record(candidate: Candidate) -> dict[str, Any]:
     return {
         "product_id": candidate.product_id,
@@ -183,7 +209,7 @@ def candidate_to_alert_record(candidate: Candidate, alert_type: str, catalyst_id
         "alert_type": alert_type,
         "detection_time": datetime.now(timezone.utc),
         "detection_price": candidate.quote.price,
-        "score": candidate.score.early_move_score,
+        "score": primary_score(candidate),
         "component_scores": candidate.score.components,
         "reasons": candidate.score.reasons,
         "risks": candidate.score.risks,
@@ -202,6 +228,11 @@ def candidate_to_alert_record(candidate: Candidate, alert_type: str, catalyst_id
 def candidate_metrics(candidate: Candidate) -> dict[str, Any]:
     return {
         "quote_age_seconds": candidate.quote.quote_age_seconds,
+        "risk_adjusted_opportunity_score": primary_score(candidate),
+        "liquidity_safety_score": candidate.score.components.get("LiquiditySafetyScore"),
+        "market_cap_class": market_cap_class(candidate.market_cap),
+        "dollar_volume_24h": dollar_volume_24h(candidate.volume),
+        "coinbase_traders": None,
         "volume": {"volume_quote": candidate.volume.volume_quote, "ratios": candidate.volume.ratios},
         "structure": {
             "base_low": candidate.structure.base_low,
@@ -218,6 +249,7 @@ def candidate_metrics(candidate: Candidate) -> dict[str, Any]:
             "spread_pct": candidate.liquidity.spread_pct,
             "bid_depth_usd": candidate.liquidity.bid_depth_usd,
             "ask_depth_usd": candidate.liquidity.ask_depth_usd,
+            "book_depth_1_pct": book_depth_usd(candidate.liquidity, "1"),
             "imbalance": candidate.liquidity.imbalance,
         },
         "tags": candidate.tags,

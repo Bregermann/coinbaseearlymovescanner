@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from app.alerts.discord import DiscordWebhookClient
 from app.analysis.liquidity import metrics_from_summary
 from app.analysis.microcaps import market_cap_metrics_from_metadata
+from app.analysis.scoring import book_depth_usd, dollar_volume_24h, market_cap_class, primary_score
 from app.analysis.structure import analyze_structure
 from app.analysis.targets import generate_targets
 from app.analysis.volume import calculate_volume_metrics
@@ -192,7 +193,7 @@ async def cmd_diagnostics(_: argparse.Namespace, settings: Settings) -> None:
     now = utc_now()
     async with session_scope(settings) as session:
         diagnostics, skipped = await service.evaluate_candidates(session, now, include_stale=True)
-        summary = diagnostics_status(diagnostics, skipped, products_checked=len(service.products))
+        summary = diagnostics_status(diagnostics, skipped, products_checked=len(service.products), settings=settings)
         statuses = await StatusRepository(session).all_status()
         baseline = await baseline_summary(session, list(service.products))
         alert_counts = await alert_count_summary(session, now)
@@ -249,7 +250,7 @@ async def cmd_diagnostics(_: argparse.Namespace, settings: Settings) -> None:
         print(f"  {reason}: {count}")
     print("top_10_current_candidates:")
     for item in diagnostics[:10]:
-        print_diagnostic_candidate(item)
+        print_diagnostic_candidate(item, settings)
 
 
 async def baseline_summary(session, product_ids: list[str]) -> dict[str, int]:
@@ -310,8 +311,8 @@ async def market_state_summary(session, now: datetime, settings: Settings) -> di
     }
 
 
-def print_diagnostic_candidate(item) -> None:
-    row = candidate_diagnostic_dict(item)
+def print_diagnostic_candidate(item, settings: Settings) -> None:
+    row = candidate_diagnostic_dict(item, settings)
     c = item.candidate
     result = "WOULD ALERT" if item.should_alert else "NO ALERT"
     if item.qualifies and not item.should_alert:
@@ -320,13 +321,18 @@ def print_diagnostic_candidate(item) -> None:
     warnings = "; ".join(item.warnings) if item.warnings else "none"
     print(
         f"  {c.symbol:8} price={money(c.quote.price)} 24h={pct(c.quote.price_change_24h_pct)} "
-        f"mcap={compact_money(c.market_cap.circulating_market_cap)} score={c.score.early_move_score:.2f} "
+        f"class={row['market_cap_class']} mcap={compact_money(c.market_cap.circulating_market_cap)} "
+        f"riskAdj={row['risk_adjusted_opportunity_score']:.2f} early={c.score.early_move_score:.2f} "
         f"tech={c.score.technical_score:.2f} cat={c.score.catalyst_score:.2f} "
+        f"liqSafety={format_optional(row['liquidity_safety_score'])} 24hDollarVol={compact_money(row['dollar_volume_24h'])} "
+        f"spread={pct(row['spread_pct'], signed=False)} depth1={compact_money(row['book_depth_1_pct'])} "
+        f"CoinbaseTraders={format_traders(row['coinbase_traders'])} "
         f"vol={format_optional(row['volume_acceleration_score'])} GoonerEMA={format_optional(row['gooner_ema_score'])} "
         f"TraderAcceleration={format_optional(row['trader_acceleration_score'])} "
         f"UpsideRunwayScore={format_optional(row['upside_runway_score'])} "
         f"upside={format_pct_value(item.upside_runway_pct)} extPenalty={format_optional(row['extension_penalty'])} "
-        f"result={result} why={reasons} warnings={warnings}"
+        f"badLiqPenalty={format_optional(row['bad_liquidity_penalty'])} thinPenalty={format_optional(row['thin_participation_penalty'])} "
+        f"dilutionPenalty={format_optional(row['dilution_penalty'])} result={result} why={reasons} warnings={warnings}"
     )
 
 
@@ -358,6 +364,10 @@ def format_event_marker(value: object) -> str:
 
 def format_optional(value: object) -> str:
     return "N/A" if value is None else f"{float(value):.2f}"
+
+
+def format_traders(value: object) -> str:
+    return "N/A" if value is None else f"{float(value):,.0f}"
 
 
 def format_pct_value(value: float | None) -> str:
@@ -415,9 +425,16 @@ async def probe_websocket_quote(product_id: str):
     return holder["quote"], holder["quote_age"]
 
 def print_candidate(candidate, verbose: bool = False) -> None:
-    print(f"{candidate.symbol} - {candidate.status.value} score={candidate.score.early_move_score:.0f}")
+    print(f"{candidate.symbol} - {candidate.status.value} risk_adjusted={primary_score(candidate):.0f} early={candidate.score.early_move_score:.0f}")
     print(f"price={money(candidate.quote.price)}  24h={pct(candidate.quote.price_change_24h_pct)}  quote_age={candidate.quote.quote_age_seconds:.1f}s")
-    print(f"market_cap={compact_money(candidate.market_cap.circulating_market_cap)} vol/mcap={pct(candidate.market_cap.volume_to_market_cap, signed=False)}")
+    print(
+        f"market_cap_class={market_cap_class(candidate.market_cap)} market_cap={compact_money(candidate.market_cap.circulating_market_cap)} "
+        f"24h_dollar_volume={compact_money(dollar_volume_24h(candidate.volume))} vol/mcap={pct(candidate.market_cap.volume_to_market_cap, signed=False)}"
+    )
+    print(
+        f"liquidity_safety={format_optional(candidate.score.components.get('LiquiditySafetyScore'))} "
+        f"spread={pct(candidate.liquidity.spread_pct, signed=False)} depth1={compact_money(book_depth_usd(candidate.liquidity, '1'))} CoinbaseTraders=N/A"
+    )
     print(f"5m={ratio(candidate.volume.ratios.get('5m_vs_baseline'))} 15m={ratio(candidate.volume.ratios.get('15m_vs_baseline'))} 1h={ratio(candidate.volume.ratios.get('1h_vs_7d'))} 4h={ratio(candidate.volume.ratios.get('4h_vs_7d'))}")
     print(f"base={money(candidate.structure.base_low)}-{money(candidate.structure.base_high)} breakout={money(candidate.structure.breakout_trigger)} invalidation={money(candidate.structure.invalidation)}")
     print(f"TP1={money(candidate.targets.tp1)} TP2={money(candidate.targets.tp2)} Stretch={money(candidate.targets.stretch)}")
