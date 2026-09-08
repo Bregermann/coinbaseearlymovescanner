@@ -54,16 +54,16 @@ def calculate_volume_metrics(candles: list[CandlePoint], now: datetime | None = 
 
 def sum_quote_volume(candles: list[CandlePoint], end: datetime, seconds: int) -> float:
     start = end - timedelta(seconds=seconds)
-    return sum(c.quote_volume for c in candles if start <= c.start < end and c.granularity_seconds <= seconds)
+    source = select_volume_source(candles, start, end, seconds)
+    return sum(c.quote_volume for c in source)
 
 
 def average_bucket_volume(candles: list[CandlePoint], now: datetime, bucket_seconds: int, lookback: timedelta) -> float:
     start = now - lookback
     current_start = now - timedelta(seconds=bucket_seconds)
     buckets: dict[int, float] = {}
-    for candle in candles:
-        if candle.start < start or candle.start >= current_start or candle.granularity_seconds > bucket_seconds:
-            continue
+    source = select_volume_source(candles, start, current_start, bucket_seconds)
+    for candle in source:
         bucket_id = int((candle.start - start).total_seconds() // bucket_seconds)
         buckets[bucket_id] = buckets.get(bucket_id, 0.0) + candle.quote_volume
     values = [value for value in buckets.values() if value > 0]
@@ -74,9 +74,8 @@ def average_daily_volume(candles: list[CandlePoint], now: datetime, lookback: ti
     start = now - lookback
     current_start = now - timedelta(days=1)
     buckets: dict[int, float] = {}
-    for candle in candles:
-        if candle.start < start or candle.start >= current_start:
-            continue
+    source = select_volume_source(candles, start, current_start, 86400, prefer_hourly=True)
+    for candle in source:
         bucket_id = int((candle.start - start).total_seconds() // 86400)
         buckets[bucket_id] = buckets.get(bucket_id, 0.0) + candle.quote_volume
     values = [value for value in buckets.values() if value > 0]
@@ -120,3 +119,38 @@ def safe_ratio(numerator: float, denominator: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return min(value, 99.0)
+
+
+def select_volume_source(
+    candles: list[CandlePoint],
+    start: datetime,
+    end: datetime,
+    max_granularity: int,
+    *,
+    prefer_hourly: bool = False,
+) -> list[CandlePoint]:
+    eligible = [
+        candle for candle in candles
+        if start <= candle.start < end
+        and candle.granularity_seconds <= max_granularity
+    ]
+    if not eligible:
+        return []
+    available = {candle.granularity_seconds for candle in eligible}
+    long_window = (end - start) >= timedelta(days=8)
+    if (
+        (prefer_hourly or long_window or max_granularity >= 3600)
+        and max_granularity >= 3600
+        and 3600 in available
+    ):
+        source_seconds = 3600
+    else:
+        preferred = [300, 60, 900, 1800, 3600]
+        source_seconds = next(
+            (value for value in preferred if value <= max_granularity and value in available),
+            min(available),
+        )
+    return [
+        candle for candle in eligible
+        if candle.granularity_seconds == source_seconds
+    ]

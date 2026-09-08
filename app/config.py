@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     alert_max_quote_age_seconds: float = 10.0
 
     scan_interval_seconds: float = 10.0
+    analysis_cache_refresh_seconds: int = 300
     candidate_limit: int = 5
     min_early_move_score: float = 78.0
     min_risk_adjusted_opportunity_score: float = 78.0
@@ -46,6 +47,43 @@ class Settings(BaseSettings):
     min_microcap_volume_acceleration_score: float = 45.0
     min_catalyst_override_score: float = 85.0
     suppress_extended_24h_pct: float = 20.0
+    bottom_detector_enabled: bool = True
+    min_bottom_forming_score: float = 76.0
+    min_bottom_forming_opportunity_score: float = 60.0
+    min_pre_breakout_score: float = 68.0
+    min_pre_breakout_opportunity_score: float = 60.0
+    min_breakout_firing_score: float = 58.0
+    min_breakout_firing_opportunity_score: float = 60.0
+    min_retest_hold_opportunity_score: float = 60.0
+    pre_breakout_max_distance_pct: float = 8.0
+    bottom_score_material_change: float = 7.0
+    breakout_score_material_change: float = 8.0
+    breakout_distance_material_shrink_pct: float = 2.0
+    bottom_setup_cooldown_minutes: int = 360
+    fibonacci_enabled: bool = True
+    fib_min_swing_confidence: float = 62.0
+    fib_high_confluence_score: float = 72.0
+    fib_probability_min_samples: int = 30
+
+    portfolio_rotation_enabled: bool = True
+    portfolio_file: str = "portfolio.json"
+    portfolio_holdings_json: str = ""
+    rotation_alerts_enabled: bool = True
+    rotation_watch_score_difference: float = 10.0
+    rotation_partial_score_difference: float = 15.0
+    rotation_strong_score_difference: float = 25.0
+    rotation_min_candidate_risk_reward: float = 1.5
+    rotation_min_risk_reward_improvement: float = 0.75
+    rotation_min_holding_deterioration: float = 35.0
+    rotation_min_confidence: float = 65.0
+    rotation_cooldown_minutes: int = 360
+    rotation_reverse_hysteresis_minutes: int = 720
+    rotation_hysteresis_extra_difference: float = 8.0
+    rotation_partial_min_pct: float = 10.0
+    rotation_partial_max_pct: float = 25.0
+    rotation_strong_max_pct: float = 35.0
+    rotation_min_position_value_usd: float = 100.0
+    rotation_outcome_poll_seconds: int = 60
 
     market_cap_large_threshold_usd: float = 1_000_000_000.0
     market_cap_mid_threshold_usd: float = 250_000_000.0

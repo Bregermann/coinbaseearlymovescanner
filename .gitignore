@@ -227,5 +227,9 @@ scanner.db-*
 .env.*
 !.env.example
 
+# Local portfolio positions
+portfolio.json
+!portfolio.example.json
+
 # Local runtime process logs
 runtime/

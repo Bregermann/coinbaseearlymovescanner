@@ -191,6 +191,60 @@ class AlertObservationModel(Base):
     alert: Mapped[AlertModel] = relationship(back_populates="observations")
 
 
+class RotationRecommendationModel(Base):
+    __tablename__ = "rotation_recommendations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    source_asset: Mapped[str] = mapped_column(String(32), index=True)
+    destination_asset: Mapped[str] = mapped_column(String(32), index=True)
+    classification: Mapped[str] = mapped_column(String(32), index=True)
+    suggested_percentage: Mapped[float] = mapped_column(Float)
+    source_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_price: Mapped[float] = mapped_column(Float)
+    source_score: Mapped[float] = mapped_column(Float)
+    destination_score: Mapped[float] = mapped_column(Float)
+    rotation_advantage: Mapped[float] = mapped_column(Float)
+    source_risk_reward: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_risk_reward: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fib_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reason: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float)
+    discord_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    observations: Mapped[list["RotationObservationModel"]] = relationship(back_populates="recommendation")
+
+
+class RotationObservationModel(Base):
+    __tablename__ = "rotation_observations"
+    __table_args__ = (UniqueConstraint("recommendation_id", "horizon", name="uq_rotation_horizon"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    recommendation_id: Mapped[int] = mapped_column(ForeignKey("rotation_recommendations.id"), index=True)
+    horizon: Mapped[str] = mapped_column(String(32), index=True)
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    source_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    source_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    relative_return_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    destination_outperformed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    recommendation: Mapped[RotationRecommendationModel] = relationship(back_populates="observations")
+
+
+class HistoryBootstrapStateModel(Base):
+    __tablename__ = "history_bootstrap_state"
+
+    product_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    granularity_seconds: Mapped[int] = mapped_column(Integer, primary_key=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    earliest_candle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    latest_candle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ScannerStatusModel(Base):
     __tablename__ = "scanner_status"
 

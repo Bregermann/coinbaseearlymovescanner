@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from sqlalchemy import Select, and_, desc, func, select
+from sqlalchemy import Select, and_, desc, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
@@ -13,9 +15,12 @@ from app.database.models import (
     CandleModel,
     CandidateSnapshotModel,
     CatalystModel,
+    HistoryBootstrapStateModel,
     MarketTickModel,
     OrderBookSnapshotModel,
     ProductModel,
+    RotationObservationModel,
+    RotationRecommendationModel,
     ScannerStatusModel,
 )
 from app.timeutils import utc_now
@@ -41,6 +46,34 @@ def _ensure_utc(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def candle_point_from_row(row: Any) -> CandlePoint:
+    return CandlePoint(
+        product_id=row.product_id,
+        start=_ensure_utc(row.start) or row.start,
+        granularity_seconds=row.granularity_seconds,
+        open=row.open,
+        high=row.high,
+        low=row.low,
+        close=row.close,
+        volume=row.volume,
+        quote_volume=row.quote_volume,
+    )
+
+
+def live_quote_from_row(row: Any) -> LiveQuote:
+    return LiveQuote(
+        product_id=row.product_id,
+        price=row.price,
+        best_bid=row.best_bid,
+        best_ask=row.best_ask,
+        volume_24h=row.volume_24h,
+        price_change_24h_pct=row.price_change_24h_pct,
+        exchange_time=_ensure_utc(row.exchange_time),
+        ingestion_time=_ensure_utc(row.ingestion_time) or row.ingestion_time,
+        last_trade_time=_ensure_utc(row.last_trade_time),
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -171,6 +204,37 @@ class MarketRepository:
             )
         return quotes
 
+    async def recent_latest_quotes(
+        self,
+        product_ids: list[str],
+        row_limit: int = 250_000,
+    ) -> dict[str, LiveQuote]:
+        if not product_ids:
+            return {}
+        result = await self.session.execute(
+            select(
+                MarketTickModel.product_id,
+                MarketTickModel.price,
+                MarketTickModel.best_bid,
+                MarketTickModel.best_ask,
+                MarketTickModel.volume_24h,
+                MarketTickModel.price_change_24h_pct,
+                MarketTickModel.exchange_time,
+                MarketTickModel.ingestion_time,
+                MarketTickModel.last_trade_time,
+            )
+            .where(MarketTickModel.product_id.in_(product_ids))
+            .order_by(MarketTickModel.id.desc())
+            .limit(row_limit)
+        )
+        quotes: dict[str, LiveQuote] = {}
+        for row in result:
+            if row.product_id not in quotes:
+                quotes[row.product_id] = live_quote_from_row(row)
+                if len(quotes) == len(product_ids):
+                    break
+        return quotes
+
     async def upsert_candle(self, candle: CandlePoint, source: str = "coinbase") -> None:
         result = await self.session.execute(
             select(CandleModel).where(
@@ -205,11 +269,51 @@ class MarketRepository:
             model.updated_at = utc_now()
 
     async def upsert_candles(self, candles: Iterable[CandlePoint], source: str = "coinbase") -> int:
-        count = 0
-        for candle in candles:
-            await self.upsert_candle(candle, source=source)
-            count += 1
-        return count
+        rows = list(candles)
+        if not rows:
+            return 0
+        dialect = self.session.get_bind().dialect.name
+        if dialect not in {"sqlite", "postgresql"}:
+            for candle in rows:
+                await self.upsert_candle(candle, source=source)
+            return len(rows)
+
+        insert_factory = sqlite_insert if dialect == "sqlite" else postgresql_insert
+        now = utc_now()
+        values = [
+            {
+                "product_id": candle.product_id,
+                "start": candle.start,
+                "granularity_seconds": candle.granularity_seconds,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "volume": candle.volume,
+                "quote_volume": candle.quote_volume,
+                "source": source,
+                "updated_at": now,
+            }
+            for candle in rows
+        ]
+        for offset in range(0, len(values), 80):
+            statement = insert_factory(CandleModel).values(values[offset:offset + 80])
+            excluded = statement.excluded
+            statement = statement.on_conflict_do_update(
+                index_elements=["product_id", "start", "granularity_seconds"],
+                set_={
+                    "open": excluded.open,
+                    "high": excluded.high,
+                    "low": excluded.low,
+                    "close": excluded.close,
+                    "volume": excluded.volume,
+                    "quote_volume": excluded.quote_volume,
+                    "source": excluded.source,
+                    "updated_at": now,
+                },
+            )
+            await self.session.execute(statement)
+        return len(rows)
 
     async def recent_candles(self, product_id: str, since: datetime, limit: int | None = None) -> list[CandlePoint]:
         stmt: Select[tuple[CandleModel]] = (
@@ -234,6 +338,156 @@ class MarketRepository:
             )
             for row in result.scalars()
         ]
+
+    async def candle_bounds(
+        self,
+        product_id: str,
+        granularity_seconds: int,
+    ) -> tuple[datetime | None, datetime | None]:
+        result = await self.session.execute(
+            select(func.min(CandleModel.start), func.max(CandleModel.start)).where(
+                CandleModel.product_id == product_id,
+                CandleModel.granularity_seconds == granularity_seconds,
+            )
+        )
+        earliest, latest = result.one()
+        return _ensure_utc(earliest), _ensure_utc(latest)
+
+    async def history_bootstrap_completed(self, product_id: str, granularity_seconds: int) -> bool:
+        state = await self.session.get(
+            HistoryBootstrapStateModel,
+            {"product_id": product_id, "granularity_seconds": granularity_seconds},
+        )
+        return state is not None
+
+    async def mark_history_bootstrap_completed(
+        self,
+        product_id: str,
+        granularity_seconds: int,
+        earliest: datetime | None,
+        latest: datetime | None,
+    ) -> None:
+        key = {"product_id": product_id, "granularity_seconds": granularity_seconds}
+        state = await self.session.get(HistoryBootstrapStateModel, key)
+        if state is None:
+            state = HistoryBootstrapStateModel(**key)
+            self.session.add(state)
+        state.completed_at = utc_now()
+        state.earliest_candle_at = earliest
+        state.latest_candle_at = latest
+
+    async def analysis_candles(
+        self,
+        product_id: str,
+        now: datetime,
+        history_days: int = 31,
+    ) -> list[CandlePoint]:
+        short_start = now - timedelta(days=2)
+        long_start = now - timedelta(days=max(31, history_days))
+        result = await self.session.execute(
+            select(CandleModel)
+            .where(
+                CandleModel.product_id == product_id,
+                or_(
+                    and_(
+                        CandleModel.granularity_seconds.in_({300, 900}),
+                        CandleModel.start >= short_start,
+                    ),
+                    and_(
+                        CandleModel.granularity_seconds == 3600,
+                        CandleModel.start >= long_start,
+                    ),
+                ),
+            )
+            .order_by(CandleModel.start.asc())
+        )
+        rows = list(result.scalars())
+        if not any(row.granularity_seconds in {300, 900} for row in rows):
+            fallback = await self.session.execute(
+                select(CandleModel)
+                .where(
+                    CandleModel.product_id == product_id,
+                    CandleModel.granularity_seconds == 60,
+                    CandleModel.start >= now - timedelta(hours=12),
+                )
+                .order_by(CandleModel.start.asc())
+            )
+            rows.extend(fallback.scalars())
+            rows.sort(key=lambda row: row.start)
+        return [
+            CandlePoint(
+                product_id=row.product_id,
+                start=_ensure_utc(row.start) or row.start,
+                granularity_seconds=row.granularity_seconds,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume,
+                quote_volume=row.quote_volume,
+            )
+            for row in rows
+        ]
+
+    async def analysis_candles_many(
+        self,
+        product_ids: list[str],
+        now: datetime,
+        history_days: int = 31,
+    ) -> dict[str, list[CandlePoint]]:
+        if not product_ids:
+            return {}
+        short_start = now - timedelta(days=2)
+        long_start = now - timedelta(days=max(31, history_days))
+        columns = (
+            CandleModel.product_id,
+            CandleModel.start,
+            CandleModel.granularity_seconds,
+            CandleModel.open,
+            CandleModel.high,
+            CandleModel.low,
+            CandleModel.close,
+            CandleModel.volume,
+            CandleModel.quote_volume,
+        )
+        result = await self.session.execute(
+            select(*columns)
+            .where(
+                CandleModel.product_id.in_(product_ids),
+                or_(
+                    and_(
+                        CandleModel.granularity_seconds.in_({300, 900}),
+                        CandleModel.start >= short_start,
+                    ),
+                    and_(
+                        CandleModel.granularity_seconds == 3600,
+                        CandleModel.start >= long_start,
+                    ),
+                ),
+            )
+            .order_by(CandleModel.product_id.asc(), CandleModel.start.asc())
+        )
+        mapped: dict[str, list[CandlePoint]] = {product_id: [] for product_id in product_ids}
+        has_short: set[str] = set()
+        for row in result:
+            mapped[row.product_id].append(candle_point_from_row(row))
+            if row.granularity_seconds in {300, 900}:
+                has_short.add(row.product_id)
+
+        missing_short = [product_id for product_id in product_ids if product_id not in has_short]
+        if missing_short:
+            fallback = await self.session.execute(
+                select(*columns)
+                .where(
+                    CandleModel.product_id.in_(missing_short),
+                    CandleModel.granularity_seconds == 60,
+                    CandleModel.start >= now - timedelta(hours=12),
+                )
+                .order_by(CandleModel.product_id.asc(), CandleModel.start.asc())
+            )
+            for row in fallback:
+                mapped[row.product_id].append(candle_point_from_row(row))
+        return mapped
 
     async def insert_order_book_summary(self, product_id: str, summary: dict[str, Any]) -> None:
         bid = summary.get("bid_depth_usd", {}) or {}
@@ -268,6 +522,30 @@ class MarketRepository:
         )
         return result.scalar_one_or_none()
 
+    async def recent_order_book_summaries(
+        self,
+        product_ids: list[str],
+        row_limit: int = 50_000,
+    ) -> dict[str, dict[str, Any]]:
+        if not product_ids:
+            return {}
+        result = await self.session.execute(
+            select(
+                OrderBookSnapshotModel.product_id,
+                OrderBookSnapshotModel.raw_summary,
+            )
+            .where(OrderBookSnapshotModel.product_id.in_(product_ids))
+            .order_by(OrderBookSnapshotModel.id.desc())
+            .limit(row_limit)
+        )
+        summaries: dict[str, dict[str, Any]] = {}
+        for row in result:
+            if row.product_id not in summaries and row.raw_summary:
+                summaries[row.product_id] = row.raw_summary
+                if len(summaries) == len(product_ids):
+                    break
+        return summaries
+
     async def highs_since_windows(self, product_id: str, windows: dict[str, datetime]) -> dict[str, float]:
         highs: dict[str, float] = {}
         for label, since in windows.items():
@@ -281,6 +559,31 @@ class MarketRepository:
             if value is not None:
                 highs[label] = float(value)
         return highs
+
+    async def highs_since_windows_many(
+        self,
+        product_ids: list[str],
+        windows: dict[str, datetime],
+    ) -> dict[str, dict[str, float]]:
+        mapped: dict[str, dict[str, float]] = {
+            product_id: {} for product_id in product_ids
+        }
+        for label, since in windows.items():
+            result = await self.session.execute(
+                select(
+                    CandleModel.product_id,
+                    func.max(CandleModel.high).label("high"),
+                )
+                .where(
+                    CandleModel.product_id.in_(product_ids),
+                    CandleModel.start >= since,
+                )
+                .group_by(CandleModel.product_id)
+            )
+            for row in result:
+                if row.high is not None:
+                    mapped[row.product_id][label] = float(row.high)
+        return mapped
 
 
 class MetadataRepository:
@@ -421,6 +724,80 @@ class AlertRepository:
             return []
         result = await self.session.execute(select(AlertObservationModel).where(AlertObservationModel.alert_id.in_(alert_ids)))
         return list(result.scalars())
+
+
+class RotationRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def create_recommendation(self, data: dict[str, Any]) -> RotationRecommendationModel:
+        model = RotationRecommendationModel(**data)
+        self.session.add(model)
+        await self.session.flush()
+        return model
+
+    async def create_observation_schedule(self, recommendation: RotationRecommendationModel) -> None:
+        horizons = {
+            "1h": timedelta(hours=1),
+            "4h": timedelta(hours=4),
+            "12h": timedelta(hours=12),
+            "24h": timedelta(hours=24),
+            "3d": timedelta(days=3),
+            "7d": timedelta(days=7),
+        }
+        for label, delta in horizons.items():
+            self.session.add(
+                RotationObservationModel(
+                    recommendation_id=recommendation.id,
+                    horizon=label,
+                    due_at=recommendation.created_at + delta,
+                )
+            )
+
+    async def recent_recommendations(self, since: datetime) -> list[RotationRecommendationModel]:
+        result = await self.session.execute(
+            select(RotationRecommendationModel)
+            .where(RotationRecommendationModel.created_at >= since)
+            .order_by(desc(RotationRecommendationModel.created_at))
+        )
+        return list(result.scalars())
+
+    async def due_observations(
+        self,
+        now: datetime | None = None,
+    ) -> list[tuple[RotationObservationModel, RotationRecommendationModel]]:
+        now = now or utc_now()
+        result = await self.session.execute(
+            select(RotationObservationModel, RotationRecommendationModel)
+            .join(
+                RotationRecommendationModel,
+                RotationRecommendationModel.id == RotationObservationModel.recommendation_id,
+            )
+            .where(
+                RotationObservationModel.observed_at.is_(None),
+                RotationObservationModel.due_at <= now,
+            )
+            .order_by(RotationObservationModel.due_at.asc())
+        )
+        return list(result.tuples())
+
+    async def observations_since(
+        self,
+        since: datetime,
+    ) -> list[tuple[RotationObservationModel, RotationRecommendationModel]]:
+        result = await self.session.execute(
+            select(RotationObservationModel, RotationRecommendationModel)
+            .join(
+                RotationRecommendationModel,
+                RotationRecommendationModel.id == RotationObservationModel.recommendation_id,
+            )
+            .where(
+                RotationRecommendationModel.created_at >= since,
+                RotationObservationModel.observed_at.is_not(None),
+            )
+            .order_by(desc(RotationRecommendationModel.created_at))
+        )
+        return list(result.tuples())
 
 
 class StatusRepository:

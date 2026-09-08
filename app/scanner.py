@@ -5,13 +5,17 @@ import logging
 import os
 from collections import Counter
 from datetime import timedelta
+from time import perf_counter
 from typing import Any
 
 from app.alerts.deduplication import AlertDeduplicator
 from app.alerts.discord import DiscordWebhookClient
-from app.alerts.formatter import candidate_to_alert_record, candidate_to_record
+from app.alerts.formatter import candidate_to_alert_record, candidate_to_record, rotation_to_payload, rotation_to_record
+from app.analysis.bottoms import analyze_bottom_structure, candidate_alert_stage, empty_bottom_metrics
+from app.analysis.fibonacci import analyze_fibonacci, empty_fib_metrics
 from app.analysis.liquidity import metrics_from_summary
 from app.analysis.microcaps import dormancy_score, market_cap_metrics_from_metadata, microcap_tags
+from app.analysis.portfolio_rotation import apply_portfolio_rotation
 from app.analysis.rotation import microcap_rotation_score
 from app.analysis.scoring import apply_risk_adjusted_opportunity, market_cap_class, primary_score, score_candidate
 from app.analysis.structure import analyze_structure
@@ -35,12 +39,15 @@ from app.database.repositories import (
     MarketRepository,
     MetadataRepository,
     ProductRepository,
+    RotationRepository,
     StatusRepository,
 )
 from app.metadata import CoinGeckoMetadataClient
+from app.performance.rotation import RotationOutcomeTracker
 from app.performance.tracker import PerformanceTracker
+from app.portfolio import load_portfolio
 from app.timeutils import utc_now
-from app.types import Candidate, CandlePoint, LiveQuote, MarketCapMetrics, ProductInfo, SetupStatus
+from app.types import BottomStage, Candidate, CandlePoint, LiveQuote, MarketCapMetrics, ProductInfo, RotationClassification, SetupStatus
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,7 @@ class ScannerService:
         self.discord = DiscordWebhookClient(self.settings)
         self.deduplicator = AlertDeduplicator(self.settings)
         self.performance = PerformanceTracker(self.settings)
+        self.rotation_tracker = RotationOutcomeTracker(self.settings)
         self.started_at = utc_now()
         self.last_quote_at = None
         self.last_quote_product_id = None
@@ -68,6 +76,12 @@ class ScannerService:
         self.last_candle_product_id = None
         self.last_book_at = None
         self.last_book_product_id = None
+        self._analysis_candle_cache: dict[str, list[CandlePoint]] = {}
+        self._historical_high_cache: dict[str, dict[str, float]] = {}
+        self._persisted_quote_cache: dict[str, LiveQuote] = {}
+        self._persisted_book_cache: dict[str, dict[str, Any]] = {}
+        self._analysis_cache_at = None
+        self._history_full_attempts: set[tuple[str, int]] = set()
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
 
@@ -96,6 +110,7 @@ class ScannerService:
             asyncio.create_task(self._history_bootstrap_loop(), name="history-bootstrap-loop"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat-loop"),
             asyncio.create_task(self.performance.run_forever(), name="performance-tracker"),
+            asyncio.create_task(self.rotation_tracker.run_forever(), name="rotation-tracker"),
         ]
         logger.info("scanner_started", extra={"_products": len(self.products)})
 
@@ -104,6 +119,8 @@ class ScannerService:
         await self.catalysts.stop()
         if self.ws_client:
             await self.ws_client.stop()
+        self.performance.stop()
+        self.rotation_tracker.stop()
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -159,21 +176,50 @@ class ScannerService:
                 for candidate in candidates:
                     await alert_repo.insert_candidate_snapshot(candidate_to_record(candidate))
                 sent = 0
+                used_rotation_sources: set[str] = set()
                 for candidate in candidates:
+                    source = rotation_source_ticker(candidate)
+                    if source and source in used_rotation_sources:
+                        suppress_same_scan_rotation(candidate)
+                        source = None
                     if await self._maybe_alert(session, candidate, quote_age_seconds=diagnostic_quote_age(diagnostics, candidate.product_id)):
                         sent += 1
+                        if source:
+                            used_rotation_sources.add(source)
+                rotation_sent = 0
+                selected_products = {candidate.product_id for candidate in candidates}
+                if self.settings.rotation_alerts_enabled:
+                    for item in diagnostics:
+                        if item.candidate.product_id in selected_products:
+                            continue
+                        source = rotation_source_ticker(item.candidate)
+                        if source and source in used_rotation_sources:
+                            continue
+                        if not standalone_rotation_eligible(item.candidate, item.quote_age_seconds, self.settings):
+                            continue
+                        if await self._maybe_rotation_alert(
+                            session,
+                            item.candidate,
+                            quote_age_seconds=item.quote_age_seconds,
+                        ):
+                            rotation_sent = 1
+                            if source:
+                                used_rotation_sources.add(source)
+                            break
                 scan_status = {
                     "last_scan_at": now.isoformat(),
                     "qualifying": len(candidates),
                     "alerts_sent_this_scan": sent,
+                    "rotation_alerts_sent_this_scan": rotation_sent,
                     "top": [
-                        {"symbol": c.symbol, "score": primary_score(c), "early_move_score": c.score.early_move_score, "status": c.status.value}
+                        {"symbol": c.symbol, "score": primary_score(c), "early_move_score": c.score.early_move_score, "status": candidate_alert_stage(c)}
                         for c in candidates
                     ],
                 }
                 diag_status = diagnostics_status(diagnostics, skipped, products_checked=len(self.products), settings=self.settings)
                 diag_status["last_scan_at"] = now.isoformat()
                 diag_status["alerts_sent_this_scan"] = sent
+                diag_status["rotation_alerts_sent_this_scan"] = rotation_sent
                 await StatusRepository(session).set_status("scan", scan_status)
                 await StatusRepository(session).set_status("diagnostics", diag_status)
         return candidates
@@ -186,12 +232,12 @@ class ScannerService:
         include_stale: bool = False,
     ) -> tuple[list[Any], dict[str, int]]:
         now = now or utc_now()
-        since = now - timedelta(days=max(self.settings.analysis_history_days, 31))
         diagnostics: list[Any] = []
         skipped: Counter[str] = Counter()
         volume_by_asset = {}
         cap_by_asset: dict[str, MarketCapMetrics] = {}
         pending: list[tuple[ProductInfo, LiveQuote, float | None, list[CandlePoint], Any, dict[str, Any] | None]] = []
+        evaluated: list[tuple[Candidate, int, float | None, Any | None]] = []
 
         market_repo = MarketRepository(session)
         metadata_repo = MetadataRepository(session)
@@ -201,9 +247,72 @@ class ScannerService:
         fresh_catalysts = await catalyst_repo.fresh_catalysts(now - timedelta(minutes=self.settings.catalyst_fresh_window_minutes))
         catalyst_by_asset = _catalyst_map(fresh_catalysts)
         active_alerts = await alert_repo.active_alerts_by_product()
+        holdings = load_portfolio(self.settings)
+        rotation_lookback = max(
+            self.settings.rotation_cooldown_minutes,
+            self.settings.rotation_reverse_hysteresis_minutes,
+        )
+        recent_rotations = (
+            await RotationRepository(session).recent_recommendations(
+                now - timedelta(minutes=rotation_lookback)
+            )
+            if holdings else []
+        )
+        evaluation_started = perf_counter()
+        product_ids = list(self.products)
+        cache_age = (
+            (now - self._analysis_cache_at).total_seconds()
+            if self._analysis_cache_at is not None else None
+        )
+        refresh_cache = (
+            not self._analysis_candle_cache
+            or cache_age is None
+            or cache_age >= self.settings.analysis_cache_refresh_seconds
+        )
+        if refresh_cache:
+            self._analysis_candle_cache = await market_repo.analysis_candles_many(
+                product_ids,
+                now,
+                self.settings.analysis_history_days,
+            )
+            missing_quotes = [
+                product_id for product_id in product_ids
+                if product_id not in self.latest_quotes
+            ]
+            self._persisted_quote_cache.update(
+                await market_repo.recent_latest_quotes(missing_quotes)
+            )
+            missing_books = [
+                product_id for product_id in product_ids
+                if product_id not in self.latest_book_summaries
+            ]
+            self._persisted_book_cache.update(
+                await market_repo.recent_order_book_summaries(missing_books)
+            )
+            self._historical_high_cache = await market_repo.highs_since_windows_many(
+                product_ids,
+                {
+                    "90d": now - timedelta(days=90),
+                    "180d": now - timedelta(days=180),
+                    "1y": now - timedelta(days=365),
+                },
+            )
+            self._analysis_cache_at = now
+            logger.info(
+                "analysis_cache_refreshed",
+                extra={
+                    "_products": len(self._analysis_candle_cache),
+                    "_candles": sum(len(rows) for rows in self._analysis_candle_cache.values()),
+                    "_seconds": round(perf_counter() - evaluation_started, 3),
+                },
+            )
+        analysis_candles = self._analysis_candle_cache
+        persisted_quotes = self._persisted_quote_cache
+        persisted_books = self._persisted_book_cache
+        historical_highs = self._historical_high_cache
 
         for product in self.products.values():
-            quote = self.latest_quotes.get(product.product_id) or await market_repo.latest_quote(product.product_id)
+            quote = self.latest_quotes.get(product.product_id) or persisted_quotes.get(product.product_id)
             if quote is None or quote.price <= 0:
                 skipped["missing data"] += 1
                 continue
@@ -214,7 +323,7 @@ class ScannerService:
             ):
                 skipped["stale data"] += 1
                 continue
-            candles = await market_repo.recent_candles(product.product_id, since)
+            candles = analysis_candles.get(product.product_id, [])
             if len(candles) < 12:
                 skipped["insufficient history"] += 1
                 continue
@@ -225,23 +334,59 @@ class ScannerService:
             pending.append((product, quote, quote_age, candles, volume, catalyst_by_asset.get(product.base_currency)))
 
         rotation_scores = microcap_rotation_score(cap_by_asset, volume_by_asset, threshold=self.settings.microcap_threshold_usd)
+        benchmark_candles = {
+            product.base_currency: candles
+            for product, _quote, _age, candles, _volume, _catalyst in pending
+            if product.base_currency in {"BTC", "ETH"}
+        }
         for product, quote, quote_age, candles, volume, catalyst in pending:
             structure = analyze_structure(candles, quote.price, now)
-            structure.highs.update(
-                await market_repo.highs_since_windows(
-                    product.product_id,
-                    {
-                        "90d": now - timedelta(days=90),
-                        "180d": now - timedelta(days=180),
-                        "1y": now - timedelta(days=365),
-                    },
-                )
-            )
+            structure.highs.update(historical_highs.get(product.product_id, {}))
             book = self.latest_book_summaries.get(product.product_id)
             if book is None:
-                row = await market_repo.latest_order_book_summary(product.product_id)
-                book = row.raw_summary if row and row.raw_summary else None
+                book = persisted_books.get(product.product_id)
             liquidity = metrics_from_summary(book)
+            bottom = (
+                analyze_bottom_structure(
+                    candles,
+                    quote.price,
+                    now,
+                    benchmark_candles=benchmark_candles,
+                    liquidity=liquidity,
+                )
+                if self.settings.bottom_detector_enabled
+                else empty_bottom_metrics()
+            )
+            fib = (
+                analyze_fibonacci(
+                    candles,
+                    quote.price,
+                    now,
+                    structure=structure,
+                    bottom=bottom,
+                    minimum_confidence=self.settings.fib_min_swing_confidence,
+                    probability_min_samples=self.settings.fib_probability_min_samples,
+                )
+                if self.settings.fibonacci_enabled
+                else empty_fib_metrics()
+            )
+            volume.ratios.update(
+                {
+                    "15m_vs_prior_20": bottom.components.get("15mVolumeVsPrior20", 0.0),
+                    "1h_vs_prior_24": bottom.components.get("1hVolumeVsPrior24", 0.0),
+                    "4h_vs_prior_42": bottom.components.get("4hVolumeVsPrior42", 0.0),
+                }
+            )
+            if bottom.stage.value != "NONE":
+                if bottom.support is not None:
+                    structure.support_low = bottom.support
+                    structure.support_high = max(bottom.support, quote.price) if quote.price <= bottom.support * 1.03 else structure.support_high
+                if bottom.resistance is not None:
+                    structure.resistance = bottom.resistance
+                    structure.breakout_trigger = bottom.resistance
+                    structure.distance_from_resistance_pct = bottom.distance_to_breakout_pct
+                if bottom.invalidation is not None:
+                    structure.invalidation = bottom.invalidation
             cap = cap_by_asset[product.base_currency]
             dormant = dormancy_score(candles, now)
             rotation = rotation_scores.get(product.base_currency, 0.0)
@@ -260,10 +405,20 @@ class ScannerService:
             )
             if dormant >= 70.0 and cap.circulating_market_cap and cap.circulating_market_cap <= self.settings.microcap_threshold_usd:
                 score.components["DormancyScore"] = max(score.components.get("DormancyScore", 0.0), dormant)
-            targets = generate_targets(quote.price, structure)
-            score = apply_risk_adjusted_opportunity(score, volume, structure, liquidity, cap, targets, quote.price)
+            targets = generate_targets(quote.price, structure, fib=fib)
+            score = apply_risk_adjusted_opportunity(
+                score,
+                volume,
+                structure,
+                liquidity,
+                cap,
+                targets,
+                quote.price,
+                bottom=bottom,
+                fib=fib,
+            )
             status = choose_status(structure.status, score.catalyst_score, structure.extension_24h_pct)
-            tags = build_tags(product, cap, volume, structure, score, self.settings, catalyst)
+            tags = build_tags(product, cap, volume, structure, score, self.settings, catalyst, bottom)
             candidate = Candidate(
                 product_id=product.product_id,
                 symbol=product.base_currency,
@@ -276,9 +431,40 @@ class ScannerService:
                 targets=targets,
                 score=score,
                 catalyst=catalyst,
-                tags=tags,
+                tags=list(dict.fromkeys(tags + fib.tags)),
+                bottom=bottom,
+                fib=fib,
             )
-            active = active_alerts.get(product.product_id)
+            evaluated.append(
+                (candidate, len(candles), quote_age, active_alerts.get(product.product_id))
+            )
+
+        assessments = apply_portfolio_rotation(
+            [row[0] for row in evaluated],
+            holdings,
+            self.settings,
+            recent_recommendations=recent_rotations,
+            now=now,
+        ) if holdings else []
+        await StatusRepository(session).set_status(
+            "portfolio_rotation",
+            {
+                "configured": bool(holdings),
+                "holdings": len(holdings),
+                "evaluated_holdings": len([row for row in assessments if row.current_price is not None]),
+                "rotation_protected": [row.ticker for row in assessments if row.protected],
+                "actionable_candidates": sum(
+                    1 for candidate, *_ in evaluated
+                    if candidate.rotation
+                    and candidate.rotation.classification in {
+                        RotationClassification.PARTIAL_ROTATION,
+                        RotationClassification.STRONG_ROTATION,
+                    }
+                ),
+                "updated_at": now.isoformat(),
+            },
+        )
+        for candidate, candle_count, quote_age, active in evaluated:
             decision = None
             if not qualification_blockers(candidate, self.settings, quote_age):
                 decision = self.deduplicator.decide(candidate, active, quote_age_seconds=quote_age)
@@ -286,7 +472,7 @@ class ScannerService:
                 build_candidate_diagnostic(
                     candidate,
                     self.settings,
-                    candle_count=len(candles),
+                    candle_count=candle_count,
                     active_alert=active,
                     alert_decision=decision,
                     quote_age_seconds=quote_age,
@@ -294,6 +480,13 @@ class ScannerService:
             )
 
         diagnostics.sort(key=lambda item: primary_score(item.candidate), reverse=True)
+        logger.info(
+            "candidate_evaluation_complete",
+            extra={
+                "_candidates": len(diagnostics),
+                "_seconds": round(perf_counter() - evaluation_started, 3),
+            },
+        )
         return diagnostics, dict(skipped)
 
     async def _maybe_alert(self, session: Any, candidate: Candidate, quote_age_seconds: float | None = None) -> bool:
@@ -320,8 +513,45 @@ class ScannerService:
         alert = await alert_repo.create_alert(alert_data)
         if decision.alert_type != "invalidation":
             await alert_repo.create_observation_schedule(alert)
+        await self._persist_rotation_recommendation(session, candidate, message_id)
         logger.info("alert_sent", extra={"_product_id": candidate.product_id, "_type": decision.alert_type, "_score": primary_score(candidate)})
         return True
+
+    async def _maybe_rotation_alert(
+        self,
+        session: Any,
+        candidate: Candidate,
+        *,
+        quote_age_seconds: float | None,
+    ) -> bool:
+        payload = rotation_to_payload(candidate, quote_age_seconds=quote_age_seconds)
+        message_id = await self.discord.send_payload(payload, webhook_url=self.settings.alert_webhook)
+        if message_id is None:
+            logger.error("rotation_alert_delivery_failed", extra={"_product_id": candidate.product_id})
+            return False
+        await self._persist_rotation_recommendation(session, candidate, message_id)
+        logger.info(
+            "rotation_alert_sent",
+            extra={
+                "_source": candidate.rotation.best_source.ticker if candidate.rotation and candidate.rotation.best_source else None,
+                "_destination": candidate.symbol,
+                "_classification": candidate.rotation.classification.value if candidate.rotation else None,
+            },
+        )
+        return True
+
+    async def _persist_rotation_recommendation(
+        self,
+        session: Any,
+        candidate: Candidate,
+        message_id: str | None,
+    ) -> None:
+        data = rotation_to_record(candidate, discord_message_id=message_id)
+        if data is None:
+            return
+        repo = RotationRepository(session)
+        recommendation = await repo.create_recommendation(data)
+        await repo.create_observation_schedule(recommendation)
 
     async def _start_websocket(self) -> None:
         product_ids = list(self.products)
@@ -348,6 +578,19 @@ class ScannerService:
     async def _on_candle(self, candle: CandlePoint) -> None:
         self.last_candle_at = utc_now()
         self.last_candle_product_id = candle.product_id
+        if candle.granularity_seconds in {300, 900, 3600}:
+            rows = self._analysis_candle_cache.setdefault(candle.product_id, [])
+            rows[:] = [
+                row for row in rows
+                if not (
+                    row.start == candle.start
+                    and row.granularity_seconds == candle.granularity_seconds
+                )
+            ]
+            rows.append(candle)
+            rows.sort(key=lambda row: row.start)
+            cutoff = utc_now() - timedelta(days=max(31, self.settings.analysis_history_days))
+            rows[:] = [row for row in rows if row.start >= cutoff]
         await _put_latest(self.candle_queue, candle)
 
     async def _on_book_summary(self, product_id: str, summary: dict[str, Any]) -> None:
@@ -519,17 +762,54 @@ class ScannerService:
         now = utc_now()
         total = 0
         ranges = [
-            ("ONE_MINUTE", now - timedelta(hours=24), now),
-            ("FIVE_MINUTE", now - timedelta(days=min(self.settings.bootstrap_history_days, 7)), now),
-            ("ONE_HOUR", now - timedelta(days=self.settings.bootstrap_history_days), now),
+            ("ONE_MINUTE", 60, now - timedelta(hours=24), now),
+            ("FIVE_MINUTE", 300, now - timedelta(days=min(self.settings.bootstrap_history_days, 7)), now),
+            ("ONE_HOUR", 3600, now - timedelta(days=self.settings.bootstrap_history_days), now),
         ]
-        for granularity, start, end in ranges:
+        for granularity, seconds, desired_start, end in ranges:
+            key = (product_id, seconds)
             try:
+                async with session_scope(self.settings) as session:
+                    market_repo = MarketRepository(session)
+                    earliest, latest = await market_repo.candle_bounds(product_id, seconds)
+                    bootstrap_completed = await market_repo.history_bootstrap_completed(product_id, seconds)
+                coverage_tolerance = timedelta(seconds=seconds * 3)
+                complete_coverage = bool(
+                    earliest is not None
+                    and earliest <= desired_start + coverage_tolerance
+                )
+                coverage_known = complete_coverage or bootstrap_completed or key in self._history_full_attempts
+                if (
+                    latest is not None
+                    and coverage_known
+                    and (now - latest).total_seconds() <= seconds * 2
+                ):
+                    self._history_full_attempts.add(key)
+                    continue
+                full_attempt = not coverage_known
+                if latest is not None and coverage_known:
+                    start = max(desired_start, latest - timedelta(seconds=seconds * 2))
+                else:
+                    start = desired_start
+                succeeded = True
                 async for candles in rest.iter_candle_ranges(product_id, start, end, granularity=granularity):
                     async with session_scope(self.settings) as session:
                         total += await MarketRepository(session).upsert_candles(candles, source="coinbase-rest")
             except Exception as exc:  # noqa: BLE001
+                succeeded = False
                 logger.warning("history_bootstrap_product_failed", extra={"_product_id": product_id, "_granularity": granularity, "_error_type": type(exc).__name__})
+            if succeeded:
+                self._history_full_attempts.add(key)
+                if full_attempt or not bootstrap_completed:
+                    async with session_scope(self.settings) as session:
+                        market_repo = MarketRepository(session)
+                        updated_earliest, updated_latest = await market_repo.candle_bounds(product_id, seconds)
+                        await market_repo.mark_history_bootstrap_completed(
+                            product_id,
+                            seconds,
+                            updated_earliest,
+                            updated_latest,
+                        )
         if total:
             logger.info("history_bootstrapped", extra={"_product_id": product_id, "_candles": total})
         return total
@@ -562,6 +842,7 @@ def build_tags(
     score: Any,
     settings: Settings,
     catalyst: dict[str, Any] | None,
+    bottom: Any | None = None,
 ) -> list[str]:
     tags = microcap_tags(cap, settings.microcap_threshold_usd)
     cap_class = market_cap_class(
@@ -587,6 +868,8 @@ def build_tags(
         tags.append("exceptional_microcap")
     if catalyst:
         tags.append(str(catalyst.get("source", "catalyst")))
+    if bottom is not None and bottom.stage.value != "NONE":
+        tags.append(bottom.stage.value.lower().replace("-", "_").replace(" ", "_"))
     if cap.circulating_market_cap and cap.circulating_market_cap <= settings.microcap_threshold_usd and structure.compression_score >= 60.0:
         tags.append("dormant_microcap")
     return list(dict.fromkeys(tags))
@@ -663,3 +946,64 @@ def diagnostic_quote_age(diagnostics: list[Any], product_id: str) -> float | Non
         if item.candidate.product_id == product_id:
             return item.quote_age_seconds
     return None
+
+
+def standalone_rotation_eligible(
+    candidate: Candidate,
+    quote_age_seconds: float | None,
+    settings: Settings,
+) -> bool:
+    rotation = candidate.rotation
+    if rotation is None or rotation.best_source is None:
+        return False
+    if rotation.classification == RotationClassification.NO_ROTATION:
+        return False
+    if quote_age_seconds is None or quote_age_seconds > settings.alert_max_quote_age_seconds:
+        return False
+    if rotation.confidence < settings.rotation_min_confidence:
+        return False
+    if rotation.candidate_score < 55.0:
+        return False
+    if rotation.classification == RotationClassification.WATCH_ROTATION:
+        return bool(
+            candidate.fib
+            and candidate.fib.reliable
+            and candidate.bottom
+            and candidate.bottom.stage in {
+                BottomStage.PRE_BREAKOUT,
+                BottomStage.BREAKOUT_FIRING,
+                BottomStage.RETEST_HOLD,
+            }
+        )
+    return True
+
+
+def rotation_source_ticker(candidate: Candidate) -> str | None:
+    rotation = candidate.rotation
+    if (
+        rotation is None
+        or rotation.best_source is None
+        or rotation.classification == RotationClassification.NO_ROTATION
+    ):
+        return None
+    return rotation.best_source.ticker
+
+
+def suppress_same_scan_rotation(candidate: Candidate) -> None:
+    rotation = candidate.rotation
+    if rotation is None or rotation.best_source is None:
+        return
+    rotation.classification = RotationClassification.NO_ROTATION
+    rotation.suggested_percentage = 0.0
+    rotation.best_source.classification = RotationClassification.NO_ROTATION
+    rotation.best_source.suggested_percentage = 0.0
+    rotation.best_source.reason = "a higher-ranked candidate already used this funding source in the current scan"
+    candidate.tags = [
+        tag for tag in candidate.tags
+        if tag not in {
+            "watch_rotation",
+            "partial_rotation",
+            "strong_rotation",
+            "reflexive_fib_rotation_edge",
+        }
+    ]

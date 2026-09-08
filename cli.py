@@ -6,11 +6,15 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from app.alerts.discord import DiscordWebhookClient
+from app.analysis.bottoms import analyze_bottom_structure, candidate_alert_stage
+from app.analysis.fibonacci import analyze_fibonacci
 from app.analysis.liquidity import metrics_from_summary
 from app.analysis.microcaps import market_cap_metrics_from_metadata
+from app.analysis.portfolio_rotation import assess_holding
 from app.analysis.scoring import book_depth_usd, dollar_volume_24h, market_cap_class, primary_score
 from app.analysis.structure import analyze_structure
 from app.analysis.targets import generate_targets
+from app.analysis.validation import validate_bottom_history
 from app.analysis.volume import calculate_volume_metrics
 from app.coinbase.candles import bootstrap_product_history
 from app.coinbase.products import canonicalize_spot_products
@@ -19,14 +23,16 @@ from app.coinbase.websocket import CoinbaseWebSocketClient
 from app.config import Settings, get_settings
 from sqlalchemy import func, select
 
-from app.database.connection import init_db, session_scope
-from app.database.models import AlertModel, CandleModel, CandidateSnapshotModel, MarketTickModel, OrderBookSnapshotModel
+from app.database.connection import close_db, init_db, session_scope
+from app.database.models import AlertModel, CandleModel, CandidateSnapshotModel, MarketTickModel, OrderBookSnapshotModel, ProductModel
 from app.database.repositories import CatalystRepository, MarketRepository, MetadataRepository, ProductRepository, StatusRepository
 from app.diagnostics import candidate_diagnostic_dict, diagnostics_status
 from app.formatting import compact_money, money, pct, ratio
 from app.logging import configure_logging
 from app.metadata import CoinGeckoMetadataClient
 from app.performance.statistics import performance_report
+from app.performance.rotation import rotation_backtest_report
+from app.portfolio import load_portfolio
 from app.scanner import ScannerService
 from app.timeutils import human_duration, utc_now
 
@@ -122,6 +128,16 @@ async def cmd_coin(args: argparse.Namespace, settings: Settings) -> None:
     structure = analyze_structure(candles, quote.price, utc_now())
     cap = market_cap_metrics_from_metadata(metadata, quote)
     liquidity = metrics_from_summary(book.raw_summary if book else None)
+    bottom = analyze_bottom_structure(candles, quote.price, utc_now(), liquidity=liquidity)
+    fib = analyze_fibonacci(
+        candles,
+        quote.price,
+        utc_now(),
+        structure=structure,
+        bottom=bottom,
+        minimum_confidence=settings.fib_min_swing_confidence,
+        probability_min_samples=settings.fib_probability_min_samples,
+    )
     print(f"{symbol} / {product_id}")
     print(f"price: {money(quote.price)}")
     print(f"quote age: {quote.quote_age_seconds if quote.quote_age_seconds is not None else 'unknown'} sec")
@@ -133,6 +149,16 @@ async def cmd_coin(args: argparse.Namespace, settings: Settings) -> None:
     print(f"breakout: {money(structure.breakout_trigger)}")
     print(f"invalidation: {money(structure.invalidation)}")
     print(f"spread: {pct(liquidity.spread_pct, signed=False)}")
+    print(f"bottom stage: {bottom.stage.value}")
+    print(f"pattern: {bottom.pattern}")
+    print(f"bottom_score: {bottom.bottom_score:.2f}")
+    print(f"breakout_score: {bottom.breakout_score:.2f}")
+    print(f"distance_to_breakout: {format_pct_value(bottom.distance_to_breakout_pct)}")
+    print(
+        f"fib: {fib.signal} ({fib.timeframe}, confidence {fib.swing_confidence:.2f}, "
+        f"confluence {fib.confluence_score:.2f})"
+        if fib.reliable else "fib: N/A"
+    )
 
 
 async def cmd_microcaps(_: argparse.Namespace, settings: Settings) -> None:
@@ -180,6 +206,33 @@ async def cmd_performance(_: argparse.Namespace, settings: Settings) -> None:
     print(await performance_report(days=30))
 
 
+async def cmd_rotation_backtest(args: argparse.Namespace, settings: Settings) -> None:
+    await init_db(settings)
+    print(await rotation_backtest_report(settings, days=args.days))
+
+
+async def cmd_portfolio(_: argparse.Namespace, settings: Settings) -> None:
+    holdings = load_portfolio(settings)
+    if not holdings:
+        print("portfolio: not configured (no holdings were inferred)")
+        return
+    service = ScannerService(settings)
+    await init_db(settings)
+    await service.refresh_products()
+    async with session_scope(settings) as session:
+        diagnostics, _skipped = await service.evaluate_candidates(session, utc_now(), include_stale=True)
+    candidates = {item.candidate.symbol: item.candidate for item in diagnostics}
+    print(f"portfolio_holdings: {len(holdings)}")
+    for holding in holdings:
+        assessment = assess_holding(holding, candidates.get(holding.ticker))
+        state = "ROTATION_PROTECTED" if assessment.protected else "eligible for comparison"
+        print(
+            f"{assessment.ticker}: hold_score={assessment.hold_score:.2f} "
+            f"deterioration={assessment.deterioration_score:.2f} "
+            f"risk_reward={format_optional(assessment.risk_reward)} state={state}"
+        )
+
+
 async def cmd_test_discord(_: argparse.Namespace, settings: Settings) -> None:
     async with DiscordWebhookClient(settings) as discord:
         message_id = await discord.send_test_message()
@@ -195,9 +248,13 @@ async def cmd_diagnostics(_: argparse.Namespace, settings: Settings) -> None:
         diagnostics, skipped = await service.evaluate_candidates(session, now, include_stale=True)
         summary = diagnostics_status(diagnostics, skipped, products_checked=len(service.products), settings=settings)
         statuses = await StatusRepository(session).all_status()
-        baseline = await baseline_summary(session, list(service.products))
+        baseline = baseline_summary_from_cache(
+            service._analysis_candle_cache,
+            list(service.products),
+            now,
+        )
         alert_counts = await alert_count_summary(session, now)
-        market_state = await market_state_summary(session, now, settings)
+        market_state = await market_state_summary(session, now, settings, statuses)
         active_alerts = (await session.execute(select(func.count()).select_from(AlertModel).where(AlertModel.is_active.is_(True)))).scalar_one()
         missing_discord_ids = (
             await session.execute(select(func.count()).select_from(AlertModel).where(AlertModel.discord_message_id.is_(None)))
@@ -233,11 +290,20 @@ async def cmd_diagnostics(_: argparse.Namespace, settings: Settings) -> None:
     print(f"database_last_write: {market_state['database_last_write']}")
     print(f"discord_alert_webhook_url: {'configured' if settings.alert_webhook else 'missing'}")
     print(f"debug_heartbeat_webhook_url: {'configured' if settings.debug_webhook else 'missing'}")
+    portfolio = statuses.get("portfolio_rotation", {}).get("value", {})
+    print(f"portfolio_configured: {'YES' if portfolio.get('configured') else 'NO'}")
+    print(f"portfolio_holdings: {portfolio.get('holdings', 0)}")
+    print(f"portfolio_holdings_evaluated: {portfolio.get('evaluated_holdings', 0)}")
+    print(f"rotation_actionable_candidates: {portfolio.get('actionable_candidates', 0)}")
     print(f"candidates_evaluated_last_minute: {summary['candidates_evaluated']}")
     print(f"candidates_score_gte_50: {summary['score_counts']['gte_50']}")
     print(f"candidates_score_gte_60: {summary['score_counts']['gte_60']}")
     print(f"candidates_score_gte_70: {summary['score_counts']['gte_70']}")
     print(f"candidates_score_gte_80: {summary['score_counts']['gte_80']}")
+    print(f"bottom_forming_now: {summary['stage_counts'].get('BOTTOM FORMING', 0)}")
+    print(f"pre_breakout_now: {summary['stage_counts'].get('PRE-BREAKOUT', 0)}")
+    print(f"breakout_firing_now: {summary['stage_counts'].get('BREAKOUT FIRING', 0)}")
+    print(f"retest_hold_now: {summary['stage_counts'].get('RETEST HOLD', 0)}")
     print(f"qualifying_alerts_now: {summary['would_alert_now']}")
     print(f"alerts_last_1h: {alert_counts['1h']}")
     print(f"alerts_last_4h: {alert_counts['4h']}")
@@ -253,24 +319,116 @@ async def cmd_diagnostics(_: argparse.Namespace, settings: Settings) -> None:
         print_diagnostic_candidate(item, settings)
 
 
+async def cmd_validate_bottoms(args: argparse.Namespace, settings: Settings) -> None:
+    await init_db(settings)
+    now = utc_now()
+    symbols = [value.upper() for value in args.symbols]
+    requested = set(symbols) | {"BTC", "ETH"}
+    async with session_scope(settings) as session:
+        rows = list(
+            (
+                await session.execute(
+                    select(ProductModel).where(
+                        ProductModel.base_currency.in_(requested),
+                        ProductModel.quote_currency.in_({"USD", "USDC"}),
+                    )
+                )
+            ).scalars()
+        )
+        products = {}
+        for row in sorted(rows, key=lambda item: (item.base_currency, item.quote_currency != "USD")):
+            products.setdefault(row.base_currency, row.product_id)
+        candle_map = {
+            asset: await MarketRepository(session).recent_candles(
+                product_id,
+                now - timedelta(days=max(45, args.days + 10)),
+            )
+            for asset, product_id in products.items()
+        }
+
+    benchmarks = {
+        asset: candle_map[asset]
+        for asset in ("BTC", "ETH")
+        if asset in candle_map
+    }
+    print("Coinbase bottom / pre-breakout validation")
+    print("Replay rule: closed candles only; no future candle data is visible to the detector.")
+    for symbol in symbols:
+        product_id = products.get(symbol)
+        if not product_id:
+            print(f"\n{symbol}: FAIL - no Coinbase USD/USDC spot product")
+            continue
+        result = validate_bottom_history(
+            symbol,
+            product_id,
+            candle_map.get(symbol, []),
+            benchmark_candles=benchmarks,
+            now=now,
+            settings=settings,
+            breakout_lookback_days=args.days,
+        )
+        print(f"\n{symbol} ({product_id})")
+        print(f"first alert timestamp: {format_datetime(result.first_alert_timestamp)}")
+        print(f"price at first alert: {money(result.first_alert_price)}")
+        print(f"breakout timestamp: {format_datetime(result.breakout_timestamp)}")
+        print(f"breakout price: {money(result.breakout_price)}")
+        print(f"maximum price after alert: {money(result.maximum_price_after_alert)}")
+        print(f"maximum upside after alert: {format_pct_value(result.maximum_upside_after_alert_pct)}")
+        print(f"alert stage: {result.alert_stage or 'NONE'}")
+        print(f"bottom_score: {format_optional(result.bottom_score)}")
+        print(f"breakout_score: {format_optional(result.breakout_score)}")
+        print(f"alerted before breakout: {'YES' if result.alerted_before_breakout else 'NO'}")
+        if result.failure_reason:
+            print(f"failure reason: {result.failure_reason}")
+
+
 async def baseline_summary(session, product_ids: list[str]) -> dict[str, int]:
     now = utc_now()
     since30 = now - timedelta(days=30)
     complete = 0
     incomplete = 0
-    no_history = 0
-    for product_id in product_ids:
-        earliest, count = (
-            await session.execute(
-                select(func.min(CandleModel.start), func.count())
-                .where(CandleModel.product_id == product_id, CandleModel.start >= since30)
-            )
-        ).one()
-        if count == 0:
-            no_history += 1
-            continue
+    rows = await session.execute(
+        select(
+            CandleModel.product_id,
+            func.min(CandleModel.start),
+            func.count(),
+        )
+        .where(
+            CandleModel.product_id.in_(product_ids),
+            CandleModel.start >= since30,
+            CandleModel.granularity_seconds == 3600,
+        )
+        .group_by(CandleModel.product_id)
+    )
+    history = {
+        product_id: (earliest, count)
+        for product_id, earliest, count in rows
+    }
+    for product_id, (earliest, _count) in history.items():
         earliest = ensure_utc(earliest)
         if earliest and earliest <= since30 + timedelta(hours=2):
+            complete += 1
+        else:
+            incomplete += 1
+    no_history = len(set(product_ids) - set(history))
+    return {"complete_30d": complete, "incomplete_30d": incomplete, "no_history": no_history}
+
+
+def baseline_summary_from_cache(
+    candle_map: dict[str, list],
+    product_ids: list[str],
+    now: datetime,
+) -> dict[str, int]:
+    cutoff = now - timedelta(days=30)
+    complete = incomplete = no_history = 0
+    for product_id in product_ids:
+        hourly = [
+            candle for candle in candle_map.get(product_id, [])
+            if candle.granularity_seconds == 3600
+        ]
+        if not hourly:
+            no_history += 1
+        elif min(candle.start for candle in hourly) <= cutoff + timedelta(hours=2):
             complete += 1
         else:
             incomplete += 1
@@ -286,28 +444,44 @@ async def alert_count_summary(session, now: datetime) -> dict[str, int]:
     return counts
 
 
-async def market_state_summary(session, now: datetime, settings: Settings) -> dict[str, str | int]:
-    latest_exchange = (await session.execute(select(func.max(MarketTickModel.exchange_time)))).scalar_one()
-    latest_ingestion = (await session.execute(select(func.max(MarketTickModel.ingestion_time)))).scalar_one()
-    latest_candle = (await session.execute(select(func.max(CandleModel.updated_at)))).scalar_one()
-    latest_book = (await session.execute(select(func.max(OrderBookSnapshotModel.captured_at)))).scalar_one()
-    latest_snapshot = (await session.execute(select(func.max(CandidateSnapshotModel.created_at)))).scalar_one()
-    fresh_since = now - timedelta(seconds=max(60.0, settings.alert_max_quote_age_seconds))
-    fresh_assets = (
-        await session.execute(
-            select(func.count(func.distinct(MarketTickModel.product_id))).where(MarketTickModel.exchange_time >= fresh_since)
+async def market_state_summary(
+    session,
+    now: datetime,
+    settings: Settings,
+    statuses: dict | None = None,
+) -> dict[str, str | int]:
+    websocket = (statuses or {}).get("websocket", {}).get("value", {})
+    if isinstance(websocket, dict):
+        ticker = websocket.get("last_ticker") or {}
+        received_at = parse_datetime(ticker.get("received_at")) if isinstance(ticker, dict) else None
+        quote_age = (
+            f"{max(0.0, (now - received_at).total_seconds()):.3f}"
+            if received_at is not None else "n/a"
         )
-    ).scalar_one()
+        return {
+            "quote_age_seconds": quote_age,
+            "assets_receiving_live_data": int(websocket.get("assets_receiving_live_data", 0) or 0),
+            "database_last_write": str(websocket.get("last_persist_at") or "n/a"),
+        }
+
+    latest_tick = (
+        await session.execute(
+            select(MarketTickModel)
+            .order_by(MarketTickModel.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     quote_age = "n/a"
-    latest_exchange = ensure_utc(latest_exchange)
+    latest_exchange = ensure_utc(latest_tick.exchange_time) if latest_tick else None
     if latest_exchange is not None:
         quote_age = f"{max(0.0, (now - latest_exchange).total_seconds()):.3f}"
-    writes = [ensure_utc(value) for value in [latest_ingestion, latest_candle, latest_book, latest_snapshot] if value]
-    database_last_write = max(writes).isoformat() if writes else "n/a"
     return {
         "quote_age_seconds": quote_age,
-        "assets_receiving_live_data": fresh_assets,
-        "database_last_write": database_last_write,
+        "assets_receiving_live_data": 1 if latest_tick else 0,
+        "database_last_write": (
+            ensure_utc(latest_tick.ingestion_time).isoformat()
+            if latest_tick else "n/a"
+        ),
     }
 
 
@@ -323,6 +497,13 @@ def print_diagnostic_candidate(item, settings: Settings) -> None:
         f"  {c.symbol:8} price={money(c.quote.price)} 24h={pct(c.quote.price_change_24h_pct)} "
         f"class={row['market_cap_class']} mcap={compact_money(c.market_cap.circulating_market_cap)} "
         f"riskAdj={row['risk_adjusted_opportunity_score']:.2f} early={c.score.early_move_score:.2f} "
+        f"stage={row['alert_stage']} pattern={row['pattern'] or 'N/A'} "
+        f"bottom={format_optional(row['bottom_score'])} breakout={format_optional(row['breakout_score'])} "
+        f"breakoutDistance={format_pct_value(row['distance_to_breakout_pct'])} "
+        f"fib={row['fib_signal']} fibTF={row['fib_timeframe'] or 'N/A'} "
+        f"fibConfidence={format_optional(row['fib_swing_confidence'])} fibConfluence={format_optional(row['fib_confluence_score'])} "
+        f"rotation={row['rotation_classification'] or 'N/A'} source={row['best_rotation_source'] or 'N/A'} "
+        f"advantage={format_optional(row['rotation_advantage'])} "
         f"tech={c.score.technical_score:.2f} cat={c.score.catalyst_score:.2f} "
         f"liqSafety={format_optional(row['liquidity_safety_score'])} 24hDollarVol={compact_money(row['dollar_volume_24h'])} "
         f"spread={pct(row['spread_pct'], signed=False)} depth1={compact_money(row['book_depth_1_pct'])} "
@@ -372,6 +553,11 @@ def format_traders(value: object) -> str:
 
 def format_pct_value(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f}%"
+
+
+def format_datetime(value: datetime | None) -> str:
+    return value.isoformat() if value is not None else "n/a"
+
 
 async def hydrate_missing_quotes(service: ScannerService, settings: Settings) -> None:
     for product_id in list(service.products):
@@ -425,7 +611,7 @@ async def probe_websocket_quote(product_id: str):
     return holder["quote"], holder["quote_age"]
 
 def print_candidate(candidate, verbose: bool = False) -> None:
-    print(f"{candidate.symbol} - {candidate.status.value} risk_adjusted={primary_score(candidate):.0f} early={candidate.score.early_move_score:.0f}")
+    print(f"{candidate.symbol} - {candidate_alert_stage(candidate)} risk_adjusted={primary_score(candidate):.0f} early={candidate.score.early_move_score:.0f}")
     print(f"price={money(candidate.quote.price)}  24h={pct(candidate.quote.price_change_24h_pct)}  quote_age={candidate.quote.quote_age_seconds:.1f}s")
     print(
         f"market_cap_class={market_cap_class(candidate.market_cap)} market_cap={compact_money(candidate.market_cap.circulating_market_cap)} "
@@ -437,6 +623,26 @@ def print_candidate(candidate, verbose: bool = False) -> None:
     )
     print(f"5m={ratio(candidate.volume.ratios.get('5m_vs_baseline'))} 15m={ratio(candidate.volume.ratios.get('15m_vs_baseline'))} 1h={ratio(candidate.volume.ratios.get('1h_vs_7d'))} 4h={ratio(candidate.volume.ratios.get('4h_vs_7d'))}")
     print(f"base={money(candidate.structure.base_low)}-{money(candidate.structure.base_high)} breakout={money(candidate.structure.breakout_trigger)} invalidation={money(candidate.structure.invalidation)}")
+    if candidate.bottom:
+        print(
+            f"pattern={candidate.bottom.pattern} bottom={candidate.bottom.bottom_score:.0f} "
+            f"breakoutScore={candidate.bottom.breakout_score:.0f} "
+            f"distance={format_pct_value(candidate.bottom.distance_to_breakout_pct)}"
+        )
+    if candidate.fib and candidate.fib.reliable:
+        print(
+            f"fib={candidate.fib.signal} timeframe={candidate.fib.timeframe} "
+            f"confidence={candidate.fib.swing_confidence:.0f} confluence={candidate.fib.confluence_score:.0f} "
+            f"support={money(candidate.fib.nearest_support)} resistance={money(candidate.fib.nearest_resistance)}"
+        )
+    else:
+        print("fib=N/A (no reliable active impulse)")
+    if candidate.rotation and candidate.rotation.best_source:
+        source = candidate.rotation.best_source
+        print(
+            f"rotation={candidate.rotation.classification.value} source={source.ticker} "
+            f"advantage={source.rotation_advantage:+.1f} suggested={source.suggested_percentage:.0f}%"
+        )
     print(f"TP1={money(candidate.targets.tp1)} TP2={money(candidate.targets.tp2)} Stretch={money(candidate.targets.stretch)}")
     print("why now: " + " ".join(candidate.score.reasons))
     if verbose:
@@ -457,8 +663,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("microcaps")
     sub.add_parser("catalysts")
     sub.add_parser("performance")
+    sub.add_parser("portfolio")
+    rotation_backtest = sub.add_parser("rotation-backtest")
+    rotation_backtest.add_argument("--days", type=int, default=30)
     sub.add_parser("test-discord")
     sub.add_parser("diagnostics")
+    validation = sub.add_parser("validate-bottoms")
+    validation.add_argument("symbols", nargs="*", default=["PUMP", "RNBW", "TROLL", "ZORA"])
+    validation.add_argument("--days", type=int, default=7)
     return parser
 
 
@@ -471,10 +683,20 @@ async def dispatch(args: argparse.Namespace, settings: Settings) -> None:
         "microcaps": cmd_microcaps,
         "catalysts": cmd_catalysts,
         "performance": cmd_performance,
+        "portfolio": cmd_portfolio,
+        "rotation-backtest": cmd_rotation_backtest,
         "test-discord": cmd_test_discord,
         "diagnostics": cmd_diagnostics,
+        "validate-bottoms": cmd_validate_bottoms,
     }
     await commands[args.command](args, settings)
+
+
+async def run_command(args: argparse.Namespace, settings: Settings) -> None:
+    try:
+        await dispatch(args, settings)
+    finally:
+        await close_db()
 
 
 def main() -> None:
@@ -482,7 +704,7 @@ def main() -> None:
     configure_logging(settings.log_level)
     parser = build_parser()
     args = parser.parse_args()
-    asyncio.run(dispatch(args, settings))
+    asyncio.run(run_command(args, settings))
 
 
 if __name__ == "__main__":

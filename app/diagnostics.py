@@ -7,7 +7,7 @@ from typing import Any
 
 from app.analysis.scoring import book_depth_usd, dollar_volume_24h, market_cap_class, primary_score
 from app.config import Settings
-from app.types import Candidate, LiveQuote, SetupStatus
+from app.types import BottomStage, Candidate, LiveQuote, SetupStatus
 
 
 @dataclass(slots=True)
@@ -45,10 +45,16 @@ def qualification_blockers(candidate: Candidate, settings: Settings, quote_age_s
     )
     liquidity_safety = float(candidate.score.components.get("LiquiditySafetyScore", 0.0) or 0.0)
     volume_score = float(candidate.score.components.get("VolumeAccelerationScore", 0.0) or 0.0)
+    bottom = candidate.bottom
+    bottom_stage = bottom.stage if bottom else BottomStage.NONE
 
     if age is None or age > settings.alert_max_quote_age_seconds:
         reasons.append("stale data")
-    if candidate.status == SetupStatus.ALREADY_EXTENDED and not catalyst_override:
+    if (
+        candidate.status == SetupStatus.ALREADY_EXTENDED
+        and not catalyst_override
+        and (bottom is None or bottom.bottom_score < 80.0)
+    ):
         reasons.append("24h extension too high")
 
     if cap_class == "MICROCAP" and not catalyst_override:
@@ -60,8 +66,32 @@ def qualification_blockers(candidate: Candidate, settings: Settings, quote_age_s
             reasons.append("microcap liquidity safety too low")
         if volume_score < settings.min_microcap_volume_acceleration_score:
             reasons.append("microcap volume acceleration too low")
-    elif opportunity_score < settings.min_risk_adjusted_opportunity_score and not catalyst_override:
-        reasons.append("risk-adjusted score below threshold")
+    elif not catalyst_override:
+        if bottom_stage == BottomStage.BOTTOM_FORMING:
+            if bottom.bottom_score < settings.min_bottom_forming_score:
+                reasons.append("bottom score below bottom-forming threshold")
+            if opportunity_score < settings.min_bottom_forming_opportunity_score:
+                reasons.append("risk-adjusted score below bottom-forming threshold")
+        elif bottom_stage == BottomStage.PRE_BREAKOUT:
+            if bottom.bottom_score < settings.min_pre_breakout_score:
+                reasons.append("bottom score below pre-breakout threshold")
+            if (
+                bottom.distance_to_breakout_pct is None
+                or bottom.distance_to_breakout_pct > settings.pre_breakout_max_distance_pct
+            ):
+                reasons.append("breakout resistance is not close enough")
+            if opportunity_score < settings.min_pre_breakout_opportunity_score:
+                reasons.append("risk-adjusted score below pre-breakout threshold")
+        elif bottom_stage == BottomStage.BREAKOUT_FIRING:
+            if bottom.breakout_score < settings.min_breakout_firing_score:
+                reasons.append("breakout score below firing threshold")
+            if opportunity_score < settings.min_breakout_firing_opportunity_score:
+                reasons.append("risk-adjusted score below breakout-firing threshold")
+        elif bottom_stage == BottomStage.RETEST_HOLD:
+            if opportunity_score < settings.min_retest_hold_opportunity_score:
+                reasons.append("risk-adjusted score below retest-hold threshold")
+        elif opportunity_score < settings.min_risk_adjusted_opportunity_score:
+            reasons.append("risk-adjusted score below threshold")
 
     return reasons
 
@@ -159,6 +189,11 @@ def diagnostics_status(
         "gte_80": sum(1 for item in diagnostics if primary_score(item.candidate) >= 80.0),
     }
     suppressed = Counter(skipped)
+    stage_counts = Counter(
+        item.candidate.bottom.stage.value
+        if item.candidate.bottom else item.candidate.status.value
+        for item in diagnostics
+    )
     for item in diagnostics:
         if item.should_alert:
             continue
@@ -168,6 +203,7 @@ def diagnostics_status(
         "products_checked": products_checked,
         "candidates_evaluated": len(diagnostics),
         "score_counts": score_counts,
+        "stage_counts": dict(sorted(stage_counts.items())),
         "qualifying_now": sum(1 for item in diagnostics if item.qualifies),
         "would_alert_now": sum(1 for item in diagnostics if item.should_alert),
         "suppressed_by": dict(sorted(suppressed.items())),
@@ -198,6 +234,30 @@ def candidate_diagnostic_dict(item: CandidateDiagnostic, settings: Settings | No
         "early_move_score": candidate.score.early_move_score,
         "technical_score": candidate.score.technical_score,
         "catalyst_score": candidate.score.catalyst_score,
+        "alert_stage": candidate.bottom.stage.value if candidate.bottom else candidate.status.value,
+        "pattern": candidate.bottom.pattern if candidate.bottom else None,
+        "bottom_score": candidate.bottom.bottom_score if candidate.bottom else None,
+        "breakout_score": candidate.bottom.breakout_score if candidate.bottom else None,
+        "distance_to_breakout_pct": candidate.bottom.distance_to_breakout_pct if candidate.bottom else None,
+        "first_expansion_ratio": candidate.bottom.first_expansion_ratio if candidate.bottom else None,
+        "fib_reliable": bool(candidate.fib and candidate.fib.reliable),
+        "fib_timeframe": candidate.fib.timeframe if candidate.fib else None,
+        "fib_signal": candidate.fib.signal if candidate.fib else "N/A",
+        "fib_swing_confidence": candidate.fib.swing_confidence if candidate.fib else None,
+        "fib_confluence_score": candidate.fib.confluence_score if candidate.fib else None,
+        "fib_nearest_support": candidate.fib.nearest_support if candidate.fib else None,
+        "fib_nearest_resistance": candidate.fib.nearest_resistance if candidate.fib else None,
+        "fib_0618": candidate.fib.retracements.get("0.618") if candidate.fib else None,
+        "rotation_classification": candidate.rotation.classification.value if candidate.rotation else None,
+        "relative_opportunity_score": candidate.rotation.relative_opportunity_score if candidate.rotation else None,
+        "best_rotation_source": (
+            candidate.rotation.best_source.ticker
+            if candidate.rotation and candidate.rotation.best_source else None
+        ),
+        "rotation_advantage": (
+            candidate.rotation.best_source.rotation_advantage
+            if candidate.rotation and candidate.rotation.best_source else None
+        ),
         "volume_acceleration_score": components.get("VolumeAccelerationScore"),
         "gooner_ema_score": components.get("GoonerEMAScore"),
         "trader_acceleration_score": components.get("TraderAccelerationScore"),

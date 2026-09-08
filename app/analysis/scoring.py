@@ -6,7 +6,7 @@ from typing import Any
 from app.analysis.microcaps import microcap_score
 from app.formatting import clamp
 from app.timeutils import seconds_between, utc_now
-from app.types import LiquidityMetrics, MarketCapMetrics, ScoreBreakdown, StructureMetrics, TargetPlan, VolumeMetrics
+from app.types import BottomMetrics, BottomStage, FibMetrics, LiquidityMetrics, MarketCapMetrics, ScoreBreakdown, StructureMetrics, TargetPlan, VolumeMetrics
 
 MARKET_CAP_LARGE_LABEL = "LARGE / LIQUID"
 MARKET_CAP_MID_LABEL = "MID CAP"
@@ -101,11 +101,26 @@ def apply_risk_adjusted_opportunity(
     market_cap: MarketCapMetrics,
     targets: TargetPlan,
     price: float,
+    bottom: BottomMetrics | None = None,
+    fib: FibMetrics | None = None,
 ) -> ScoreBreakdown:
     upside_pct = max_target_upside_pct(targets, price)
     score.components["UpsideRunwayScore"] = round(score_upside_runway(upside_pct), 2)
+    if fib is not None and fib.reliable:
+        score.components["FibConfluenceScore"] = round(fib.confluence_score, 2)
+        score.components["FibSwingConfidenceScore"] = round(fib.swing_confidence, 2)
+        score.components["FibSignalScore"] = round(score_fib_signal(fib.signal), 2)
+    if bottom is not None:
+        score.components["BottomScore"] = bottom.bottom_score
+        score.components["BreakoutScore"] = bottom.breakout_score
+        score.components["RelativeStrengthScore"] = bottom.relative_strength_score
+        score.components["FirstExpansionScore"] = bottom.components.get("VolumeDryupExpansionScore", 0.0)
+        score.components["StructuralOpportunityScore"] = round(
+            structural_opportunity_score(score, bottom),
+            2,
+        )
     score.components["RiskAdjustedOpportunityScore"] = round(
-        risk_adjusted_opportunity_score(score, volume, structure, liquidity, market_cap),
+        risk_adjusted_opportunity_score(score, volume, structure, liquidity, market_cap, bottom),
         2,
     )
     return score
@@ -126,22 +141,38 @@ def risk_adjusted_opportunity_score(
     structure: StructureMetrics,
     liquidity: LiquidityMetrics,
     market_cap: MarketCapMetrics,
+    bottom: BottomMetrics | None = None,
 ) -> float:
     components = score.components
     penalties = score.penalties
-    raw = (
-        score.early_move_score * 0.20
-        + components.get("UpsideRunwayScore", 42.0) * 0.18
-        + components.get("LiquiditySafetyScore", 0.0) * 0.24
-        + components.get("VolumeAccelerationScore", 0.0) * 0.15
-        + components.get("MarketCapPriorityScore", 0.0) * 0.11
-        + components.get("EarlyStageScore", 0.0) * 0.07
-        + components.get("OrderBookScore", 0.0) * 0.05
-    )
+    if bottom is None:
+        raw = (
+            score.early_move_score * 0.20
+            + components.get("UpsideRunwayScore", 42.0) * 0.18
+            + components.get("LiquiditySafetyScore", 0.0) * 0.24
+            + components.get("VolumeAccelerationScore", 0.0) * 0.15
+            + components.get("MarketCapPriorityScore", 0.0) * 0.11
+            + components.get("EarlyStageScore", 0.0) * 0.07
+            + components.get("OrderBookScore", 0.0) * 0.05
+        )
+    else:
+        raw = (
+            score.early_move_score * 0.15
+            + components.get("UpsideRunwayScore", 42.0) * 0.14
+            + components.get("LiquiditySafetyScore", 0.0) * 0.19
+            + components.get("VolumeAccelerationScore", 0.0) * 0.10
+            + components.get("MarketCapPriorityScore", 0.0) * 0.09
+            + components.get("EarlyStageScore", 0.0) * 0.05
+            + components.get("OrderBookScore", 0.0) * 0.04
+            + bottom.bottom_score * 0.16
+            + bottom.breakout_score * 0.08
+        )
     booster = (
         components.get("TraderAccelerationScore", 0.0) * 0.05
         + components.get("GoonerEMAScore", 0.0) * 0.04
         + score.catalyst_score * 0.07
+        + components.get("FibConfluenceScore", 0.0) * 0.05
+        + components.get("FibSignalScore", 0.0) * 0.03
     )
     penalty = (
         penalties.get("ExtensionPenalty", 0.0) * 0.55
@@ -151,14 +182,106 @@ def risk_adjusted_opportunity_score(
         + penalties.get("StaleDataPenalty", 0.0) * 0.70
         + penalties.get("AlreadyPumpedPenalty", 0.0) * 0.35
     )
-    return clamp(raw + booster - penalty)
+    weighted_result = raw + booster - penalty
+    if bottom is not None and bottom.stage != BottomStage.NONE:
+        structural_penalty = (
+            penalties.get("BadLiquidityPenalty", 0.0) * 0.20
+            + penalties.get("ThinParticipationPenalty", 0.0) * 0.25
+            + penalties.get("DilutionPenalty", 0.0) * 0.20
+            + penalties.get("StaleDataPenalty", 0.0) * 0.70
+            + penalties.get("ExtensionPenalty", 0.0) * 0.20
+            + penalties.get("AlreadyPumpedPenalty", 0.0) * 0.25
+        )
+        structural_result = (
+            components.get("StructuralOpportunityScore", 0.0)
+            + score.catalyst_score * 0.04
+            - structural_penalty
+        )
+        weighted_result = max(weighted_result, structural_result)
+    return clamp(weighted_result)
+
+
+def structural_opportunity_score(
+    score: ScoreBreakdown,
+    bottom: BottomMetrics,
+) -> float:
+    components = score.components
+    liquidity = components.get("LiquiditySafetyScore", 0.0)
+    cap_priority = components.get("MarketCapPriorityScore", 0.0)
+    volume = components.get("VolumeAccelerationScore", 0.0)
+    upside = components.get("UpsideRunwayScore", 42.0)
+    if bottom.stage == BottomStage.PRE_BREAKOUT:
+        raw = (
+            bottom.bottom_score * 0.50
+            + bottom.breakout_score * 0.18
+            + liquidity * 0.14
+            + cap_priority * 0.08
+            + upside * 0.06
+            + volume * 0.04
+        )
+    elif bottom.stage == BottomStage.BREAKOUT_FIRING:
+        raw = (
+            bottom.bottom_score * 0.30
+            + bottom.breakout_score * 0.34
+            + liquidity * 0.15
+            + cap_priority * 0.09
+            + upside * 0.07
+            + volume * 0.05
+        )
+    elif bottom.stage == BottomStage.RETEST_HOLD:
+        raw = (
+            bottom.bottom_score * 0.38
+            + bottom.breakout_score * 0.24
+            + liquidity * 0.16
+            + cap_priority * 0.09
+            + upside * 0.08
+            + volume * 0.05
+        )
+    else:
+        raw = (
+            bottom.bottom_score * 0.60
+            + liquidity * 0.17
+            + cap_priority * 0.10
+            + upside * 0.08
+            + volume * 0.05
+        )
+    fib_boost = (
+        components.get("FibConfluenceScore", 0.0) * 0.04
+        + components.get("FibSignalScore", 0.0) * 0.02
+    )
+    return clamp(raw + fib_boost)
+
+
+def score_fib_signal(signal: str) -> float:
+    return {
+        "0.382 BOUNCE": 62.0,
+        "0.500 RECLAIM": 76.0,
+        "GOLDEN POCKET TEST": 68.0,
+        "0.618 RECLAIM": 88.0,
+        "0.618 SUPPORT CONFIRMED": 92.0,
+        "0.786 DEEP RETRACEMENT": 55.0,
+        "1.000 BREAKOUT": 90.0,
+        "1.272 EXTENSION TEST": 42.0,
+        "1.414 EXTENSION TEST": 30.0,
+        "1.618 EXTENSION TARGET": 15.0,
+        "LOSS OF 0.618": 15.0,
+        "LOSS OF 0.786": 0.0,
+        "ACTIVE IMPULSE": 45.0,
+    }.get(signal, 0.0)
 
 
 def score_volume_acceleration(volume: VolumeMetrics) -> float:
     short = max(volume.ratios.get("5m_vs_baseline", 0.0), volume.ratios.get("15m_vs_baseline", 0.0))
     medium = max(volume.ratios.get("1h_vs_7d", 0.0), volume.ratios.get("4h_vs_7d", 0.0))
+    first_expansion = max(
+        volume.ratios.get("15m_vs_prior_20", 0.0),
+        volume.ratios.get("1h_vs_prior_24", 0.0),
+        volume.ratios.get("4h_vs_prior_42", 0.0),
+    )
     mismatch_bonus = clamp(volume.volume_vs_price_acceleration * 8.0)
-    return clamp(short * 17.0 + medium * 8.0 + mismatch_bonus * 0.25)
+    mature_surge = clamp(short * 17.0 + medium * 8.0 + mismatch_bonus * 0.25)
+    first_expansion_score = clamp((first_expansion - 0.75) * 38.0)
+    return max(mature_surge, first_expansion_score)
 
 
 def score_turnover(volume_to_market_cap: float | None) -> float:

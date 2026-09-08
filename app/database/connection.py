@@ -19,7 +19,7 @@ def get_engine(settings: Settings | None = None) -> AsyncEngine:
         settings = settings or get_settings()
         connect_args = {}
         if settings.database_url.startswith("sqlite"):
-            connect_args = {"check_same_thread": False, "timeout": 30}
+            connect_args = {"check_same_thread": False, "timeout": 120}
         _engine = create_async_engine(settings.database_url, pool_pre_ping=True, connect_args=connect_args)
         if settings.database_url.startswith("sqlite"):
             configure_sqlite(_engine)
@@ -33,7 +33,7 @@ def configure_sqlite(engine: AsyncEngine) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA busy_timeout=120000")
         cursor.close()
 
 

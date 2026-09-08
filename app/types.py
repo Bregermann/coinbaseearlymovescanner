@@ -13,6 +13,21 @@ class SetupStatus(StrEnum):
     ALREADY_EXTENDED = "ALREADY EXTENDED"
 
 
+class BottomStage(StrEnum):
+    NONE = "NONE"
+    BOTTOM_FORMING = "BOTTOM FORMING"
+    PRE_BREAKOUT = "PRE-BREAKOUT"
+    BREAKOUT_FIRING = "BREAKOUT FIRING"
+    RETEST_HOLD = "RETEST HOLD"
+
+
+class RotationClassification(StrEnum):
+    NO_ROTATION = "NO_ROTATION"
+    WATCH_ROTATION = "WATCH_ROTATION"
+    PARTIAL_ROTATION = "PARTIAL_ROTATION"
+    STRONG_ROTATION = "STRONG_ROTATION"
+
+
 class FreshnessState(StrEnum):
     IDEAL = "IDEAL"
     WARNING = "WARNING"
@@ -132,6 +147,112 @@ class TargetPlan:
 
 
 @dataclass(slots=True)
+class BottomMetrics:
+    stage: BottomStage
+    pattern: str
+    bottom_score: float
+    breakout_score: float
+    prior_drawdown_pct: float | None
+    prior_impulse_pct: float | None
+    support: float | None
+    resistance: float | None
+    invalidation: float | None
+    distance_to_breakout_pct: float | None
+    atr_compression_ratio: float | None
+    bollinger_width_ratio: float | None
+    volume_dryup_ratio: float | None
+    first_expansion_ratio: float | None
+    relative_strength_score: float
+    macd_state: str
+    rsi_state: str
+    bollinger_state: str
+    relative_strength_state: str
+    components: dict[str, float] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class FibMetrics:
+    reliable: bool
+    anchor_low: float | None
+    anchor_high: float | None
+    anchor_timestamp_low: datetime | None
+    anchor_timestamp_high: datetime | None
+    timeframe: str | None
+    swing_confidence: float
+    retracements: dict[str, float] = field(default_factory=dict)
+    extensions: dict[str, float] = field(default_factory=dict)
+    current_retracement: float | None = None
+    nearest_support: float | None = None
+    nearest_resistance: float | None = None
+    golden_pocket_low: float | None = None
+    golden_pocket_high: float | None = None
+    signal: str = "N/A"
+    confluence_score: float = 0.0
+    tags: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    target_probabilities: dict[str, float | None] = field(default_factory=dict)
+    probability_confidence: str = "insufficient historical sample"
+
+
+@dataclass(slots=True)
+class PortfolioHolding:
+    ticker: str
+    quantity: float
+    cost_basis: float | None = None
+    current_position_value: float | None = None
+
+
+@dataclass(slots=True)
+class HoldAssessment:
+    ticker: str
+    quantity: float
+    current_price: float | None
+    current_position_value: float | None
+    hold_score: float
+    expected_upside_pct: float | None
+    risk_reward: float | None
+    deterioration_score: float
+    protected: bool
+    protection_reason: str | None
+    components: dict[str, float] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RotationSource:
+    ticker: str
+    classification: RotationClassification
+    hold_score: float
+    rotation_advantage: float
+    suggested_percentage: float
+    source_price: float | None
+    source_position_value: float | None
+    source_risk_reward: float | None
+    deterioration_score: float
+    confidence: float
+    protected: bool
+    reason: str
+
+
+@dataclass(slots=True)
+class RotationRecommendation:
+    classification: RotationClassification
+    destination_ticker: str
+    candidate_score: float
+    relative_opportunity_score: float
+    candidate_risk_reward: float | None
+    suggested_percentage: float
+    confidence: float
+    best_source: RotationSource | None = None
+    sources: list[RotationSource] = field(default_factory=list)
+    protected_holdings: list[HoldAssessment] = field(default_factory=list)
+    reason: str = ""
+    fib_state: str = "N/A"
+
+
+@dataclass(slots=True)
 class ScoreBreakdown:
     technical_score: float
     catalyst_score: float
@@ -156,3 +277,8 @@ class Candidate:
     score: ScoreBreakdown
     catalyst: dict[str, Any] | None = None
     tags: list[str] = field(default_factory=list)
+    bottom: BottomMetrics | None = None
+    fib: FibMetrics | None = None
+    rotation: RotationRecommendation | None = None
+    fib: FibMetrics | None = None
+    rotation: RotationRecommendation | None = None
